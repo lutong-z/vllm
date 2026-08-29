@@ -46,6 +46,24 @@ FP8_STORE_DTYPE = torch.float8_e4m3fnuz if USE_FNUZ else torch.float8_e4m3fn
 HEAD_BYTES = NOPE_DIM + ROPE_DIM * 2 + 8  # 448 + 128 + 8 = 584
 
 
+def test_dsv4_native_writer_capability_and_schemas() -> None:
+    namespace = getattr(torch.ops, "_C", None)
+    capability = getattr(
+        namespace, "fused_deepseek_v4_nvfp4_writer_capability", None
+    )
+    if capability is None:
+        pytest.skip("stable DSV4 writer extension is not loaded")
+    assert int(capability()) == 1
+    for name in (
+        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out",
+    ):
+        op = getattr(namespace, name)
+        schemas = getattr(op, "_schemas", {})
+        values = schemas.values() if isinstance(schemas, dict) else schemas
+        assert any("use_nvfp4" in str(schema) for schema in values)
+
+
 # ── PyTorch reference implementations ────────────────────────────────────────
 
 
