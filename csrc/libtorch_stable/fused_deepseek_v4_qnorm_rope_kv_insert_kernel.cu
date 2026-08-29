@@ -118,7 +118,9 @@ struct PackedE2M1x16 {
 };
 
 __device__ __forceinline__ uint8_t floatToE2M1(float value) {
-  uint8_t const sign = (__float_as_uint(value) >> 31) & 1;
+  // Match Triton/oracle policy: both +0 and -0 encode as the +0 nibble.
+  uint8_t const sign =
+      value == 0.0f ? 0 : ((__float_as_uint(value) >> 31) & 1);
   float const magnitude = fabsf(value);
   uint8_t code;
   if (magnitude <= 0.25f)
@@ -318,6 +320,56 @@ __device__ __forceinline__ void processDeepseekV4Slot(
       elements[8 + 2 * i + 1] = f2.y;
     }
   }
+  bool values_finite = true;
+#pragma unroll
+  for (int i = 0; i < kElemsPerLane; i++) {
+    values_finite = values_finite && isfinite(elements[i]);
+  }
+  if (!values_finite) {
+    if (!isKV) {
+      scalar_t_in* dst =
+          q_out +
+          (static_cast<int64_t>(tokenIdx) * kNumHeadsQPadded + slotIdx) *
+              kHeadDim +
+          dim_base;
+      uint4 const zero4 = {0u, 0u, 0u, 0u};
+      *reinterpret_cast<uint4*>(dst) = zero4;
+      *reinterpret_cast<uint4*>(dst + 8) = zero4;
+    } else if (valid_slot) {
+      int64_t const block_idx = slot_id / cache_block_size;
+      int64_t const pos_in_block = slot_id % cache_block_size;
+      uint8_t* block_base =
+          k_cache + block_idx * static_cast<int64_t>(kv_block_stride);
+      if (use_nvfp4) {
+#ifndef USE_ROCM
+        if (laneId < 27) {
+          uint8_t* record = block_base + pos_in_block * 432;
+          uint4 const zero4 = {0u, 0u, 0u, 0u};
+          *reinterpret_cast<uint4*>(record + laneId * 16) = zero4;
+        }
+#endif
+      } else {
+        uint8_t* token = block_base + pos_in_block * kTokenDataBytes;
+        uint4 const zero4 = {0u, 0u, 0u, 0u};
+        if (laneId < 28) {
+          *reinterpret_cast<uint4*>(token + laneId * 16) = zero4;
+        } else {
+          uint8_t* rope = token + kNopeDim + (laneId - 28) * 32;
+          *reinterpret_cast<uint4*>(rope) = zero4;
+          *reinterpret_cast<uint4*>(rope + 16) = zero4;
+        }
+        if (laneId == 0) {
+          uint32_t* scale = reinterpret_cast<uint32_t*>(
+              block_base + static_cast<int64_t>(cache_block_size) *
+                                kTokenDataBytes +
+              pos_in_block * kScaleBytesPerToken);
+          scale[0] = 0u;
+          scale[1] = 0u;
+        }
+      }
+    }
+    return;
+  }
 
   // ── Q branch: RMSNorm (no weight) ───────────────────────────────────
   if (!isKV) {
@@ -362,6 +414,56 @@ __device__ __forceinline__ void processDeepseekV4Slot(
       elements[2 * p] = x_even * cos_arr[p] - x_odd * sin_arr[p];
       elements[2 * p + 1] = x_even * sin_arr[p] + x_odd * cos_arr[p];
     }
+  }
+  bool post_rope_finite = true;
+#pragma unroll
+  for (int i = 0; i < kElemsPerLane; i++) {
+    post_rope_finite = post_rope_finite && isfinite(elements[i]);
+  }
+  if (!post_rope_finite) {
+    if (!isKV) {
+      scalar_t_in* dst =
+          q_out +
+          (static_cast<int64_t>(tokenIdx) * kNumHeadsQPadded + slotIdx) *
+              kHeadDim +
+          dim_base;
+      uint4 const zero4 = {0u, 0u, 0u, 0u};
+      *reinterpret_cast<uint4*>(dst) = zero4;
+      *reinterpret_cast<uint4*>(dst + 8) = zero4;
+    } else if (valid_slot) {
+      int64_t const block_idx = slot_id / cache_block_size;
+      int64_t const pos_in_block = slot_id % cache_block_size;
+      uint8_t* block_base =
+          k_cache + block_idx * static_cast<int64_t>(kv_block_stride);
+      if (use_nvfp4) {
+#ifndef USE_ROCM
+        if (laneId < 27) {
+          uint8_t* record = block_base + pos_in_block * 432;
+          uint4 const zero4 = {0u, 0u, 0u, 0u};
+          *reinterpret_cast<uint4*>(record + laneId * 16) = zero4;
+        }
+#endif
+      } else {
+        uint8_t* token = block_base + pos_in_block * kTokenDataBytes;
+        uint4 const zero4 = {0u, 0u, 0u, 0u};
+        if (laneId < 28) {
+          *reinterpret_cast<uint4*>(token + laneId * 16) = zero4;
+        } else {
+          uint8_t* rope = token + kNopeDim + (laneId - 28) * 32;
+          *reinterpret_cast<uint4*>(rope) = zero4;
+          *reinterpret_cast<uint4*>(rope + 16) = zero4;
+        }
+        if (laneId == 0) {
+          uint32_t* scale = reinterpret_cast<uint32_t*>(
+              block_base + static_cast<int64_t>(cache_block_size) *
+                                kTokenDataBytes +
+              pos_in_block * kScaleBytesPerToken);
+          scale[0] = 0u;
+          scale[1] = 0u;
+        }
+      }
+    }
+    return;
   }
 
   // ═══════════════════════════════════════════════════════════════════

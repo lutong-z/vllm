@@ -20,6 +20,7 @@ and N_QUANT_BLOCKS ue8m0 bytes.
 """
 
 from functools import lru_cache
+import math
 from typing import Any
 
 import torch
@@ -27,6 +28,26 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .fused_indexer_q import _fp32x2_to_fp4x2
+
+
+def _validate_writer_finite_inputs(
+    *tensors: torch.Tensor,
+    capturing: bool,
+) -> None:
+    """Reject nonfinite values before any FP8/NVFP4 finite packing."""
+    finite = torch.ones((), dtype=torch.bool, device=tensors[0].device)
+    for tensor in tensors:
+        if tensor.device != finite.device:
+            raise ValueError("Triton writer inputs must share a device")
+        finite = finite & torch.isfinite(tensor).all()
+    if capturing:
+        assert_async = getattr(torch, "_assert_async", None)
+        if assert_async is None:
+            torch._assert(finite, "Triton NVFP4 writer received nonfinite input")
+        else:
+            assert_async(finite, "Triton NVFP4 writer received nonfinite input")
+    elif not bool(finite.item()):
+        raise ValueError("Triton NVFP4 writer received nonfinite input")
 
 
 def compress_norm_rope_store_triton(
@@ -56,11 +77,25 @@ def compress_norm_rope_store_triton(
     dcp_rank: int = 0,
     cp_kv_cache_interleave_size: int = 1,
 ) -> None:
+
     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
 
     Picks one of the three kernels in this module based on ``head_dim`` and
     ``use_fp4_cache``. Identical launch signature for all three.
     """
+    if not math.isfinite(float(rms_norm_eps)) or float(rms_norm_eps) <= 0.0:
+        raise ValueError("Triton NVFP4 writer requires finite positive RMS epsilon")
+    capturing = (
+        state_cache.device.type == "cuda"
+        and torch.cuda.is_available()
+        and torch.cuda.is_current_stream_capturing()
+    )
+    _validate_writer_finite_inputs(
+        state_cache,
+        rms_norm_weight,
+        cos_sin_cache,
+        capturing=capturing,
+    )
     if head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
         num_warps = 4
@@ -275,6 +310,8 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     new_odd = odd * cos_v + even * sin_v
     result = tl.interleave(new_even, new_odd)  # [TRITON_BLOCK_SIZE] fp32
     quant_input = result.to(tl.bfloat16).to(tl.float32)
+    finite_quant = (quant_input == quant_input) & (tl.abs(quant_input) < float("inf"))
+    quant_input = tl.where(finite_quant, quant_input, 0.0)
 
     if QUANT_BLOCK == 16:
         # DSV4 NVFP4 record: 256B E2M1 + 32B E4M3 group scales + 16B pad
