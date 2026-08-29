@@ -28,6 +28,7 @@
  *   [bs*576,       bs*576 + bs*8):   UE8M0 scales, 7 real + 1 pad per token
  */
 
+#include <torch/csrc/stable/c/shim.h>
 #include "torch_utils.h"
 
 #include <torch/csrc/stable/macros.h>
