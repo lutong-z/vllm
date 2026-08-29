@@ -218,7 +218,7 @@ def _probe_native_dsv4_identity(
         errors.append(writer_error)
     if errors:
         raise ValueError(
-            "native DSV4 NVFP4 capability check failed: "
+            "native DSV4 nvfp4_ds_mla reader/writer capability check failed: "
             + "; ".join(sorted(errors))
         )
 
