@@ -140,3 +140,20 @@ def test_hybrid_swa_contract_keeps_format_explicit() -> None:
     assert DeepseekSparseSWABackend.get_kv_cache_shape(
         1, 64, 1, 512, "nvfp4_ds_mla"
     ) == (1, 64, 432)
+
+
+def test_dsv4_resolver_fails_closed_without_native_b12x_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    import b12x.attention.compressed_mla.api as b12x_api
+    from vllm.models.deepseek_v4.attention import _resolve_dsv4_kv_cache_dtype
+
+    monkeypatch.setattr(b12x_api, "supports_dsv4_nvfp4", lambda *args, **kwargs: False)
+    with pytest.raises(ValueError, match="native DSV4 nvfp4_ds_mla reader"):
+        _resolve_dsv4_kv_cache_dtype(
+            True,
+            "nvfp4_ds_mla",
+            SimpleNamespace(cache_dtype="nvfp4_ds_mla"),
+        )
