@@ -437,7 +437,7 @@ def test_preserves_default_record_abi(cache_dtype):
     assert offloading_config.model.kv_cache_abi == "vllm-default-v1"
 
 
-def test_preserves_implicit_nvfp4_record_abi():
+def test_uses_layout_keyed_implicit_nvfp4_record_abi():
     config = _make_vllm_config()
     config.cache_config.cache_dtype = "nvfp4_ds_mla"
     cache_format = Nvfp4MlaCacheFormat(
@@ -453,7 +453,9 @@ def test_preserves_implicit_nvfp4_record_abi():
     ):
         offloading_config = build_offloading_config(config, _make_kv_cache_config())
 
-    assert offloading_config.model.kv_cache_abi == "vllm-default-v1"
+    assert offloading_config.model.kv_cache_abi == (
+        "nvfp4_ds_mla:fp8-rope-368:identity-v1"
+    )
 
 
 def test_resolves_heterogeneous_hybrid_block_sizes():
