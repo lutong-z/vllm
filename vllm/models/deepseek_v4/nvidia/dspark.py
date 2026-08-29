@@ -276,7 +276,8 @@ def _insert_context_kv(
         device=kv.device,
     )
     if cache_dtype == torch.uint8:
-        # fp8_ds_mla UE8M0 paged layout
+        # The context writer must match the target reader: native DSV4 uses
+        # 432-byte E2M1/E4M3 records; FP8 retains the 584-byte record.
         swa_2d = swa_cache.view(swa_cache.shape[0], -1)
         torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
             dummy_q,
@@ -288,6 +289,7 @@ def _insert_context_kv(
             attn.padded_heads,
             attn.eps,
             block_size,
+            getattr(attn, "kv_cache_dtype", "") == "nvfp4_ds_mla",
         )
     elif cache_dtype == torch.bfloat16:
         swa_3d = swa_cache.view(-1, block_size, attn.head_dim)

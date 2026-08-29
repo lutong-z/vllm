@@ -4,13 +4,12 @@
 Standalone unit test for the horizontally-fused DeepseekV4-MLA kernel:
 
   fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
-    - Q side:  per-head RMSNorm (no weight) + GPT-J RoPE on last 64 dims
-    - KV side: GPT-J RoPE on last 64 + UE8M0 FP8 quant + paged cache insert
+    - Q side: per-head RMSNorm + GPT-J RoPE on the last 64 dims
+    - KV side: FP8/UE8M0 584-byte or native NVFP4 432-byte paged insert
 
 We compare against:
   - PyTorch reference for RMSNorm + GPT-J RoPE on Q
-  - Existing Triton `quantize_and_insert_k_cache` + round-trip via
-    `dequantize_and_gather_k_cache` for KV
+  - Existing Triton quantization/dequantization references for KV
 
 The kernel is imported via
 `torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`.
@@ -27,7 +26,9 @@ from vllm.models.deepseek_v4.common.ops import (
     dequantize_and_gather_k_cache,
     quantize_and_insert_k_cache,
 )
+from vllm.models.deepseek_v4.common.ops.fused_indexer_q import _fp32x2_to_fp4x2
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 
 # ── Constants matching the kernel ────────────────────────────────────────────
 HEAD_DIM = 512
@@ -146,7 +147,16 @@ pytestmark = pytest.mark.skipif(
 
 
 def _call_fused(
-    q_in, q_head_padded, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs
+    q_in,
+    q_head_padded,
+    kv,
+    k_cache,
+    slot_mapping,
+    positions,
+    cos_sin_cache,
+    eps,
+    bs,
+    use_nvfp4=False,
 ):
     return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         q_in,
@@ -158,7 +168,88 @@ def _call_fused(
         q_head_padded,
         eps,
         bs,
+        use_nvfp4,
     )
+
+
+def _dequant_nvfp4_record(record: torch.Tensor) -> torch.Tensor:
+    packed = record[:256]
+    nibbles = torch.stack((packed & 0xF, packed >> 4), dim=-1).reshape(512)
+    magnitude = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=torch.float32,
+        device=record.device,
+    )
+    values = magnitude[(nibbles & 0x7).long()]
+    values = torch.where((nibbles & 0x8).bool(), -values, values)
+    scales = record[256:288].contiguous().view(torch.float8_e4m3fn).float()
+    return values * scales.repeat_interleave(16)
+
+
+@triton.jit
+def _pack_e2m1_kernel(x_lo, x_hi, output, width: tl.constexpr):
+    offsets = tl.arange(0, width)
+    lo = tl.load(x_lo + offsets)
+    hi = tl.load(x_hi + offsets)
+    tl.store(output + offsets, _fp32x2_to_fp4x2(lo, hi))
+
+
+def test_sm121_software_e2m1_pack_matches_reference():
+    lo = torch.tensor(
+        [-7.0, -5.0, -3.0, -1.5, -0.5, 0.0, 1.0, 4.0],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    hi = torch.tensor(
+        [6.0, 3.5, 2.5, 1.75, 0.75, 0.25, -1.0, -4.0],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    output = torch.empty(8, dtype=torch.uint8, device="cuda")
+    _pack_e2m1_kernel[(1,)](lo, hi, output, width=8)
+    expected = torch.tensor(
+        [0x7F, 0x6E, 0x4D, 0x4B, 0x29, 0x00, 0xA2, 0xE6],
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+def test_nvfp4_kv_record_matches_432_byte_contract():
+    torch.manual_seed(17)
+    device = "cuda"
+    eps = 1e-6
+    block_size = 64
+    q = torch.randn(1, 8, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    kv = torch.randn(1, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    positions = torch.tensor([37], dtype=torch.int64, device=device)
+    cos_sin = make_cos_sin_cache(128, ROPE_DIM, torch.float32, device)
+    cache = torch.zeros(1, block_size, 432, dtype=torch.uint8, device=device)
+    slot_mapping = torch.zeros(1, dtype=torch.int64, device=device)
+
+    _call_fused(
+        q,
+        8,
+        kv,
+        cache.view(1, -1),
+        slot_mapping,
+        positions,
+        cos_sin,
+        eps,
+        block_size,
+        use_nvfp4=True,
+    )
+
+    record = cache[0, 0]
+    assert torch.count_nonzero(record[:288]) > 0
+    assert torch.count_nonzero(record[288:304]) == 0
+    rotated = apply_rope_gptj_last_k(kv.float(), positions, cos_sin)[0]
+    rope = record[304:432].contiguous().view(torch.bfloat16).float()
+    torch.testing.assert_close(rope, rotated[NOPE_DIM:].float(), rtol=0, atol=0.02)
+    dequant = _dequant_nvfp4_record(record)
+    assert torch.nn.functional.cosine_similarity(
+        dequant, rotated.float(), dim=0
+    ).item() > 0.99
 
 
 def _as_stored_fp8(t: torch.Tensor) -> torch.Tensor:

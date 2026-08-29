@@ -28,22 +28,39 @@ def _get_cos_sin(
 
 
 @triton.jit
+def _float_to_e2m1(x):
+    magnitude = tl.abs(x)
+    code = tl.where(
+        magnitude <= 0.25,
+        0,
+        tl.where(
+            magnitude < 0.75,
+            1,
+            tl.where(
+                magnitude <= 1.25,
+                2,
+                tl.where(
+                    magnitude < 1.75,
+                    3,
+                    tl.where(
+                        magnitude <= 2.5,
+                        4,
+                        tl.where(
+                            magnitude < 3.5,
+                            5,
+                            tl.where(magnitude <= 5.0, 6, 7),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    return code.to(tl.uint8) | ((x < 0).to(tl.uint8) << 3)
+
+
+@triton.jit
 def _fp32x2_to_fp4x2(x_lo, x_hi):
-    # NOTE: $1 is high nibble, $2 is low nibble
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .b8 tmp;
-            cvt.rn.satfinite.e2m1x2.f32 tmp, $1, $2;
-            cvt.u32.u8 $0, tmp;
-        }
-        """,
-        constraints="=r,f,f",
-        args=[x_hi, x_lo],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    ).to(tl.uint8)
+    return _float_to_e2m1(x_lo) | (_float_to_e2m1(x_hi) << 4)
 
 
 @triton.jit

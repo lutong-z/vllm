@@ -49,10 +49,10 @@ class Nvfp4MlaCacheFormat:
 
         self.validate()
         if not self.dynamic_scale and not self.scales_file:
-            # Preserve the existing namespace for every unconfigured/default
-            # deployment. Only modes that change the record's scale semantics
-            # opt into a new external-cache identity.
-            return "vllm-default-v1"
+            # Native 432-byte records must never share a prefix namespace with
+            # the historical default or the 584-byte FP8 alias.
+            layout = "fp8-rope-368" if self.fp8_rope else "bf16-rope-432"
+            return f"nvfp4_ds_mla:{layout}:identity-v1"
 
         layout = "fp8-rope-368" if self.fp8_rope else "bf16-rope-432"
         if self.dynamic_scale:

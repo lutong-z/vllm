@@ -37,6 +37,48 @@ constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 
 namespace vllm {
 
+// SM12x (including GB10/SM121) does not implement the SM100-only
+// cvt.rn.satfinite.e2m1x2.f32 instruction. Use the software conversion from
+// vllm-project/vllm#35947, including round-to-nearest-even midpoint handling.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 1000
+__device__ __forceinline__ uint8_t sw_float_to_e2m1(float v) {
+  uint8_t sign = (__float_as_uint(v) >> 31) & 1;
+  float av = fabsf(v);
+  uint8_t e2m1;
+  if (av <= 0.25f)
+    e2m1 = 0;
+  else if (av < 0.75f)
+    e2m1 = 1;
+  else if (av <= 1.25f)
+    e2m1 = 2;
+  else if (av < 1.75f)
+    e2m1 = 3;
+  else if (av <= 2.5f)
+    e2m1 = 4;
+  else if (av < 3.5f)
+    e2m1 = 5;
+  else if (av <= 5.0f)
+    e2m1 = 6;
+  else
+    e2m1 = 7;
+  return (sign << 3) | e2m1;
+}
+
+__device__ __forceinline__ uint8_t sw_e2m1x2_from_f32(float hi, float lo) {
+  return (sw_float_to_e2m1(hi) << 4) | sw_float_to_e2m1(lo);
+}
+
+__device__ __forceinline__ uint32_t sw_fp32_vec8_to_e2m1(
+    const float2* array) {
+  uint8_t b0 = sw_e2m1x2_from_f32(array[0].y, array[0].x);
+  uint8_t b1 = sw_e2m1x2_from_f32(array[1].y, array[1].x);
+  uint8_t b2 = sw_e2m1x2_from_f32(array[2].y, array[2].x);
+  uint8_t b3 = sw_e2m1x2_from_f32(array[3].y, array[3].x);
+  return (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16) |
+         ((uint32_t)b3 << 24);
+}
+#endif
+
 template <typename Int>
 __host__ __device__ inline Int round_up(Int x, Int y) {
   static_assert(std::is_integral_v<Int>,
@@ -70,6 +112,9 @@ inline std::pair<int64_t, int64_t> computeSwizzledSFShape(int64_t m,
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec8_to_e2m1(float (&array)[8]) {
   uint32_t val;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 1000
+  val = sw_fp32_vec8_to_e2m1(reinterpret_cast<const float2*>(array));
+#else
   asm volatile(
       "{\n"
       ".reg .b8 byte0;\n"
@@ -85,12 +130,16 @@ inline __device__ uint32_t fp32_vec8_to_e2m1(float (&array)[8]) {
       : "=r"(val)
       : "f"(array[0]), "f"(array[1]), "f"(array[2]), "f"(array[3]),
         "f"(array[4]), "f"(array[5]), "f"(array[6]), "f"(array[7]));
+#endif
   return val;
 }
 
 // Convert 4 float2 values into 8 e2m1 values (represented as one uint32_t).
 __device__ __forceinline__ uint32_t fp32_vec8_to_e2m1(float2 (&array)[4]) {
   uint32_t val;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 1000
+  val = sw_fp32_vec8_to_e2m1(array);
+#else
   asm volatile(
       "{\n"
       ".reg .b8 byte0;\n"
@@ -106,6 +155,7 @@ __device__ __forceinline__ uint32_t fp32_vec8_to_e2m1(float2 (&array)[4]) {
       : "=r"(val)
       : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y),
         "f"(array[2].x), "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
+#endif
   return val;
 }
 
@@ -117,6 +167,10 @@ using fp4_packed_t = std::conditional_t<CVT_FP4_PACK16, u32x2, uint32_t>;
 
 __device__ __forceinline__ u32x2 fp32_vec16_to_e2m1(float2 (&array)[8]) {
   u32x2 out;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 1000
+  out.lo = sw_fp32_vec8_to_e2m1(array);
+  out.hi = sw_fp32_vec8_to_e2m1(array + 4);
+#else
   asm volatile(
       "{\n"
       ".reg .b8 b0;\n"
@@ -143,6 +197,7 @@ __device__ __forceinline__ u32x2 fp32_vec16_to_e2m1(float2 (&array)[8]) {
         "f"(array[2].x), "f"(array[2].y), "f"(array[3].x), "f"(array[3].y),
         "f"(array[4].x), "f"(array[4].y), "f"(array[5].x), "f"(array[5].y),
         "f"(array[6].x), "f"(array[6].y), "f"(array[7].x), "f"(array[7].y));
+#endif
   return out;
 }
 

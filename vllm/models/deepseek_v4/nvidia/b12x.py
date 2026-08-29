@@ -10,9 +10,9 @@ per-chunk prefill, and ``attn_sink``. The leaf call goes through b12x's
 ``compressed_mla_decode_forward`` leaf call). No persistent workspace object is
 held.
 
-DSV4 compressed-MLA contract (== upstream/DeepGEMM): q_head_dim = 448 NoPE +
-64 RoPE = 512, V = 512; the ``fp8_ds_mla`` 584 B/token page (448 NoPE fp8 +
-128 RoPE bf16 + 8-byte UE8M0 footer) is read directly.
+DSV4 compressed-MLA contract:
+q_head_dim = 448 NoPE + 64 RoPE = 512, V = 512. FP8 keeps the 584 B/token
+UE8M0 record; native NVFP4 uses the 432 B/token E2M1/E4M3 record.
 """
 
 import os
@@ -50,7 +50,11 @@ if TYPE_CHECKING:
 # DSV4 compressed-MLA dims (q_head_dim = 448 NoPE + 64 RoPE = 512; V = 512).
 _DSV4_HEAD_DIM = 512
 _DSV4_V_HEAD_DIM = 512
-_DSV4_CACHE_BYTES_PER_TOKEN = 584
+_DSV4_FP8_CACHE_BYTES_PER_TOKEN = 584
+_DSV4_NVFP4_CACHE_BYTES_PER_TOKEN = 432
+_DSV4_CACHE_PAD_ALIGNMENT_BYTES = 576
+_DECODE_SPLIT_TILE = 64
+_C128A_TOPK_ALIGNMENT = 128
 _VALIDATE_DCP_INDICES_ENV = "VLLM_DSV4_DCP_VALIDATE_INDICES"
 
 
@@ -88,48 +92,23 @@ def _cdiv(x: int, y: int) -> int:
     return (int(x) + int(y) - 1) // int(y)
 
 
-def _dsv4_b12x_page_nbytes(page_size: int) -> int:
-    """Return the logical DSV4 payload bytes in one cache page.
-
-    vLLM may place padding between physical pages, but the padding is not part
-    of the compressed-MLA payload.  Keeping it out of the exported view also
-    supports standalone contiguous allocations, whose physical page stride is
-    exactly ``page_size * 584`` bytes.
-
-    Args:
-        page_size: Number of tokens stored in one cache page.
-
-    Returns:
-        The logical compressed-MLA payload size in bytes.
-    """
-    return int(page_size) * _DSV4_CACHE_BYTES_PER_TOKEN
+def _dsv4_b12x_page_nbytes(page_size: int, cache_dtype: str) -> int:
+    if cache_dtype == "nvfp4_ds_mla":
+        return int(page_size) * _DSV4_NVFP4_CACHE_BYTES_PER_TOKEN
+    payload_nbytes = int(page_size) * _DSV4_FP8_CACHE_BYTES_PER_TOKEN
+    return (
+        _cdiv(payload_nbytes, _DSV4_CACHE_PAD_ALIGNMENT_BYTES)
+        * _DSV4_CACHE_PAD_ALIGNMENT_BYTES
+    )
 
 
 def _b12x_cache_page_view(
     cache: torch.Tensor,
     page_size: int,
     name: str,
+    cache_dtype: str,
 ) -> torch.Tensor:
-    """Return a uint8 ``[pages, payload_bytes]`` view for SparkInfer kernels.
-
-    Preserve the physical page stride so both padded packed allocations and
-    contiguous per-layer allocations follow the same runtime contract.
-
-    Args:
-        cache: Source paged cache tensor.
-        page_size: Number of tokens stored in one cache page.
-        name: Cache name used in validation errors.
-
-    Returns:
-        A logical byte view that preserves the source physical page stride.
-
-    Raises:
-        ValueError: If ``page_size`` is not positive.
-        RuntimeError: If the cache is not paged, a page cannot contain the
-            logical payload, pages overlap, or the payload within a page is
-            not contiguous.
-    """
-    page_nbytes = _dsv4_b12x_page_nbytes(page_size)
+    page_nbytes = _dsv4_b12x_page_nbytes(page_size, cache_dtype)
     if page_nbytes <= 0:
         raise ValueError(f"{name} page_size must be positive, got {page_size}")
 
@@ -327,6 +306,7 @@ def _run_compressed_mla(
     {16,32,64,128} by the outer wrapper). Indices are global slot ids, so no
     indexed page table is needed.
     """
+    from b12x.attention._shared.mla.traits import ScaleFormat
     from b12x.attention.compressed_mla import (
         Caps as B12XCompressedMLAScratchCaps,
     )
@@ -426,6 +406,13 @@ def _run_compressed_mla(
         return_lse=return_lse,
         lse_scale=lse_scale,
         out=output,
+        scale_format=(
+            ScaleFormat.NVFP4_E4M3
+            if int(swa_k_cache.shape[1])
+            == int(swa_page_size) * _DSV4_NVFP4_CACHE_BYTES_PER_TOKEN
+            else None
+        ),
+        fp8_rope=False,
     )
     if return_lse:
         _, lse = cast(tuple[torch.Tensor, torch.Tensor], result)
@@ -560,7 +547,9 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         key = _b12x_cache_page_view_key(cache, page_size)
         view = views.get(key)
         if view is None:
-            view = _b12x_cache_page_view(cache, page_size, name)
+            view = _b12x_cache_page_view(
+                cache, page_size, name, self.kv_cache_dtype
+            )
             views[key] = view
         return view
 

@@ -28,8 +28,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "output_s, int group_size, float eps, float int8_min, float int8_max) -> "
       "()");
   ops.def("permute_cols(Tensor A, Tensor perm) -> Tensor");
-
   ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
+
 
 #ifndef USE_ROCM
 
@@ -437,12 +437,14 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert("
       "Tensor q_in, Tensor kv, Tensor! k_cache, "
       "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
-      "int q_head_padded, float eps, int cache_block_size) -> Tensor");
+      "int q_head_padded, float eps, int cache_block_size, "
+      "bool use_nvfp4=False) -> Tensor");
   ops.def(
       "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out("
       "Tensor q_in, Tensor kv, Tensor! q_out, Tensor! k_cache, "
       "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
-      "int q_head_padded, float eps, int cache_block_size) -> ()");
+      "int q_head_padded, float eps, int cache_block_size, "
+      "bool use_nvfp4=False) -> ()");
 
   // FlashInfer V4 full-cache variants: write Q in place (bf16) or to a separate
   // FP8 tensor, and KV into a contiguous 512-wide token-strided cache.
@@ -843,6 +845,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CPU, ops) {
+  // The argument is a pinned CPU tensor. The implementation returns a CUDA
+  // UVA view, but dispatch must follow the input tensor's CPU key.
   ops.impl("get_cuda_view_from_cpu_tensor",
            TORCH_BOX(&get_cuda_view_from_cpu_tensor));
 }

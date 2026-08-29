@@ -105,10 +105,13 @@ def test_non_nvfp4_cache_abi_preserves_existing_namespace(cache_dtype):
 
 
 @pytest.mark.parametrize("fp8_rope", [False, True])
-def test_implicit_nvfp4_cache_abi_preserves_existing_namespace(fp8_rope):
+def test_implicit_nvfp4_cache_abi_is_layout_keyed(fp8_rope):
     cache_format = Nvfp4MlaCacheFormat(
         dynamic_scale=False,
         fp8_rope=fp8_rope,
         scales_file="",
     )
-    assert cache_format.record_abi("nvfp4_ds_mla") == "vllm-default-v1"
+    layout = "fp8-rope-368" if fp8_rope else "bf16-rope-432"
+    assert cache_format.record_abi("nvfp4_ds_mla") == (
+        f"nvfp4_ds_mla:{layout}:identity-v1"
+    )

@@ -1707,16 +1707,20 @@ def _make_dsv4_vllm_config(dcp: int):
     )
 
 
-def _make_dsv4_heterogeneous_kv_cache_specs():
+def _make_dsv4_heterogeneous_kv_cache_specs(
+    cache_dtype: str = "fp8_ds_mla",
+):
+    packed_alignment = 432 if cache_dtype == "nvfp4_ds_mla" else 576
+
     def full_mla_spec(compress_ratio: int):
         return MLAAttentionSpec(
             block_size=256,
             num_kv_heads=1,
             head_size=512,
             dtype=torch.uint8,
-            cache_dtype_str="fp8_ds_mla",
+            cache_dtype_str=cache_dtype,
             compress_ratio=compress_ratio,
-            alignment=576,
+            alignment=packed_alignment,
             model_version="deepseek_v4",
         )
 
@@ -1727,7 +1731,7 @@ def _make_dsv4_heterogeneous_kv_cache_specs():
             head_size=132,
             dtype=torch.uint8,
             compress_ratio=4,
-            alignment=576,
+            alignment=576 if cache_dtype == "fp8_ds_mla" else 512,
         )
 
     def swa_cache_spec():
@@ -1737,8 +1741,8 @@ def _make_dsv4_heterogeneous_kv_cache_specs():
             head_size=512,
             dtype=torch.uint8,
             sliding_window=128,
-            cache_dtype_str="fp8_ds_mla",
-            alignment=576,
+            cache_dtype_str=cache_dtype,
+            alignment=packed_alignment,
             model_version="deepseek_v4",
         )
 
@@ -1750,7 +1754,7 @@ def _make_dsv4_heterogeneous_kv_cache_specs():
             head_size=2 * (1 + overlap) * 512,
             dtype=torch.float32,
             sliding_window=(1 + overlap) * compress_ratio,
-            alignment=576,
+            alignment=576 if cache_dtype == "fp8_ds_mla" else 512,
             dcp_sharded=True,
         )
 
@@ -1780,6 +1784,25 @@ def _make_dsv4_heterogeneous_kv_cache_groups():
     grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(kv_cache_specs)
     assert grouped_specs is not None
     return kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
+
+
+def test_dsv4_nvfp4_pads_full_mla_anchor_for_compressor_state():
+    specs = _make_dsv4_heterogeneous_kv_cache_specs("nvfp4_ds_mla")
+    grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(specs)
+    assert grouped_specs is not None
+
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
+
+    full_group = groups[0].kv_cache_spec
+    assert isinstance(full_group, UniformTypeKVCacheSpecs)
+    # A logical 64-token NVFP4 page is 64 * 432 = 27,648 bytes. It is
+    # physically padded to the 32 KiB compressor-state page shared by DSV4.
+    assert max(full_group.get_page_sizes()) == 32_768
+    assert all(
+        max(group.kv_cache_spec.get_page_sizes()) <= 32_768
+        for group in groups
+        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+    )
 
 
 def test_dsv4_max_concurrency_uses_uniform_group_pool_math():

@@ -309,12 +309,13 @@ class DeepseekCompressor(nn.Module):
         )
 
         if self.head_dim == 512:
-            assert not use_fp4_cache, (
-                "MXFP4 cache is only supported for indexer (head=128)"
+            self._quant_block = 16 if use_fp4_cache else 64
+            self._token_stride = (
+                432
+                if use_fp4_cache
+                else self.nope_head_dim + self.rope_head_dim * 2
             )
-            self._quant_block = 64
-            self._token_stride = self.nope_head_dim + self.rope_head_dim * 2
-            self._scale_dim = self.nope_head_dim // 64 + 1  # 7 real + 1 pad
+            self._scale_dim = 32 if use_fp4_cache else self.nope_head_dim // 64 + 1
         elif self.head_dim == 128:
             if use_fp4_cache:
                 self._quant_block = MXFP4_BLOCK_SIZE
@@ -427,7 +428,9 @@ class DeepseekCompressor(nn.Module):
         extra_kwargs: dict[str, Any] = {}
         if current_platform.is_cuda() and not torch.compiler.is_compiling():
             # NVIDIA GPUs.
-            use_triton_compressor = self.head_dim != 512 or dcp_world_size > 1
+            use_triton_compressor = (
+                self.head_dim != 512 or dcp_world_size > 1 or self.use_fp4_cache
+            )
             if not use_triton_compressor:
                 from .nvidia.ops.sparse_attn_compress_cutedsl import (
                     compress_norm_rope_store_cutedsl,

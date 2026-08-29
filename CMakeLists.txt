@@ -900,7 +900,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     "7.5;8.0;8.7;8.9+PTX" "${CUDA_ARCHS}")
   # subtract out the archs that are already built for 3x
   list(REMOVE_ITEM SCALED_MM_2X_ARCHS ${SCALED_MM_3X_ARCHS})
-  if (SCALED_MM_2X_ARCHS)
+  option(VLLM_ENABLE_SCALED_MM_C2X
+    "Build legacy CUTLASS 2.x scaled-mm fallback kernels"
+    ON)
+  if (VLLM_ENABLE_SCALED_MM_C2X AND SCALED_MM_2X_ARCHS)
     set(SCALED_MM_C2X_SRCS "csrc/libtorch_stable/quantization/w8a8/cutlass/scaled_mm_c2x.cu")
     set_gencode_flags_for_srcs(
       SRCS "${SCALED_MM_C2X_SRCS}"
@@ -1001,9 +1004,21 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   # sources with the SM10x/11x block below; set_gencode_flags_for_srcs appends
   # per-source flags, so shared files accumulate both SM12x and SM10x/11x
   # gencodes when both families are requested.
-  cuda_archs_loose_intersection(FP4_SM120_ARCHS
-    "12.0a;12.1a" "${CUDA_ARCHS}")
-  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND FP4_SM120_ARCHS)
+  option(VLLM_ENABLE_SM12X_NVFP4
+    "Build SM12x NVFP4 kernels (disable for FP8-only GB10 builds)"
+    ON)
+  option(VLLM_ENABLE_SM12X_NVFP4_KV
+    "Build the SM12x NVFP4 KV-cache writer without the SM12x weight kernels"
+    ON)
+
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    cuda_archs_loose_intersection(FP4_SM120_ARCHS "12.0f" "${CUDA_ARCHS}")
+  else()
+    cuda_archs_loose_intersection(FP4_SM120_ARCHS "12.0a;12.1a" "${CUDA_ARCHS}")
+  endif()
+  if(VLLM_ENABLE_SM12X_NVFP4
+     AND ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8
+     AND FP4_SM120_ARCHS)
     set(FP4_SM120_SRCS
       "csrc/libtorch_stable/quantization/fp4/nvfp4_quant_kernels.cu"
       "csrc/libtorch_stable/quantization/fp4/activation_nvfp4_quant_fusion_kernels.cu"
@@ -1020,6 +1035,28 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     message(STATUS "Building SM12x NVFP4 for archs: ${FP4_SM120_ARCHS}")
   else()
     message(STATUS "Not building SM12x NVFP4 as no compatible archs were found.")
+  endif()
+
+  # The DeepSeek MLA writer lives in the existing cache_kernels.cu translation
+  # unit. Enable its SM12x branch per source so an EXL3 build can use the
+  # nvfp4_ds_mla cache format without invalidating/rebuilding every stable
+  # extension object or compiling unrelated NVFP4 weight kernels.
+  if(NOT VLLM_ENABLE_SM12X_NVFP4
+     AND VLLM_ENABLE_SM12X_NVFP4_KV
+     AND ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8
+     AND FP4_SM120_ARCHS)
+    set(FP4_SM120_KV_SRCS "csrc/libtorch_stable/cache_kernels.cu")
+    set(FP4_SM120_KV_DISPATCH_SRC
+      "csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${FP4_SM120_KV_DISPATCH_SRC}"
+      CUDA_ARCHS "${FP4_SM120_ARCHS}")
+    list(APPEND VLLM_STABLE_EXT_SRC "${FP4_SM120_KV_DISPATCH_SRC}")
+    set_property(
+      SOURCE "${FP4_SM120_KV_SRCS}"
+      APPEND PROPERTY COMPILE_DEFINITIONS ENABLE_NVFP4_SM120=1)
+    message(STATUS
+      "Building SM12x NVFP4 KV-cache writer for archs: ${FP4_SM120_ARCHS}")
   endif()
 
   # SM10x/11x FP4 kernels. MXFP4 experts quantization is currently compiled
@@ -1538,13 +1575,21 @@ endif()
 
 # For CUDA we also build and ship some external projects.
 if (VLLM_GPU_LANG STREQUAL "CUDA")
+    option(VLLM_BUILD_QUTLASS "Build and install the QuTLASS extension" ON)
+    option(VLLM_BUILD_VLLM_FLASH_ATTN
+      "Build and install bundled vLLM FlashAttention kernels"
+      ON)
     include(cmake/external_projects/deepgemm.cmake)
     include(cmake/external_projects/fmha_sm100.cmake)
     include(cmake/external_projects/flashmla.cmake)
     include(cmake/external_projects/flashkda.cmake)
-    include(cmake/external_projects/qutlass.cmake)
+    if(VLLM_BUILD_QUTLASS)
+      include(cmake/external_projects/qutlass.cmake)
+    endif()
     include(cmake/external_projects/tml_fa4.cmake)
 
     # vllm-flash-attn should be last as it overwrites some CMake functions
-    include(cmake/external_projects/vllm_flash_attn.cmake)
+    if(VLLM_BUILD_VLLM_FLASH_ATTN)
+      include(cmake/external_projects/vllm_flash_attn.cmake)
+    endif()
 endif ()
