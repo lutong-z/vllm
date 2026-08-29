@@ -1010,11 +1010,25 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   option(VLLM_ENABLE_SM12X_NVFP4_KV
     "Build the SM12x NVFP4 KV-cache writer without the SM12x weight kernels"
     ON)
+  option(VLLM_ENABLE_DSV4_NVFP4_WRITER
+    "Build the native DSV4 432-byte NVFP4 writer and capability ABI"
+    ON)
 
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
     cuda_archs_loose_intersection(FP4_SM120_ARCHS "12.0f" "${CUDA_ARCHS}")
   else()
     cuda_archs_loose_intersection(FP4_SM120_ARCHS "12.0a;12.1a" "${CUDA_ARCHS}")
+  endif()
+  set(VLLM_DSV4_NVFP4_WRITER_ENABLED OFF)
+  if(VLLM_ENABLE_DSV4_NVFP4_WRITER
+     AND (VLLM_ENABLE_SM12X_NVFP4 OR VLLM_ENABLE_SM12X_NVFP4_KV)
+     AND ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8
+     AND FP4_SM120_ARCHS)
+    set(VLLM_DSV4_NVFP4_WRITER_ENABLED ON)
+    message(STATUS
+      "Building native DSV4 432-byte NVFP4 writer for archs: ${FP4_SM120_ARCHS}")
+  else()
+    message(STATUS "Native DSV4 NVFP4 writer is disabled or has no compatible archs.")
   endif()
   if(VLLM_ENABLE_SM12X_NVFP4
      AND ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8
@@ -1218,6 +1232,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   # which is currently set to 2.11.
   target_compile_definitions(_C_stable_libtorch PRIVATE
     TORCH_TARGET_VERSION=0x020B000000000000ULL)
+  if(VLLM_DSV4_NVFP4_WRITER_ENABLED)
+    target_compile_definitions(_C_stable_libtorch PRIVATE
+      ENABLE_DSV4_NVFP4_WRITER=1)
+  endif()
 
   # Needed to use cuda/hip APIs from C-shim
   if(VLLM_GPU_LANG STREQUAL "CUDA")

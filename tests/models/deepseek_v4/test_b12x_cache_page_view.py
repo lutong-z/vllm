@@ -78,6 +78,76 @@ def test_b12x_cache_page_view_native_432_geometry() -> None:
     assert view.stride() == (page_size * 432, 1)
 
 
+@pytest.mark.parametrize("page_size", [4, 128])
+def test_b12x_cache_page_view_native_c4_c128_allocator_geometry(
+    page_size: int,
+) -> None:
+    from vllm.models.deepseek_v4.nvidia.b12x import (
+        DeepseekV4B12xMLASparseBackend,
+    )
+
+    shape = DeepseekV4B12xMLASparseBackend.get_kv_cache_shape(
+        3, page_size, 1, 512, "nvfp4_ds_mla"
+    )
+    assert shape == (3, page_size, 432)
+    cache = torch.empty(shape, dtype=torch.uint8)
+    view = _b12x_cache_page_view(cache, page_size, "native", "nvfp4_ds_mla")
+    assert view.shape == (3, page_size * 432)
+    assert view.stride() == (page_size * 432, 1)
+
+
+def test_b12x_cache_page_view_rejects_native_semantic_512_width() -> None:
+    cache = torch.empty((2, 64, 512), dtype=torch.uint8)
+    with pytest.raises(RuntimeError, match="logical record width"):
+        _b12x_cache_page_view(cache, 64, "native", "nvfp4_ds_mla")
+
+
+@pytest.mark.parametrize("page_size", [4, 128])
+def test_b12x_cache_page_view_preserves_fp8_c4_c128_payload(
+    page_size: int,
+) -> None:
+    payload = page_size * 584
+    cache = torch.empty((2, page_size, 584), dtype=torch.uint8)
+    view = _b12x_cache_page_view(cache, page_size, "fp8", "fp8_ds_mla")
+    assert view.shape == (2, payload)
+    assert view.stride() == (payload, 1)
+
+
+def test_dsv4_selector_rejects_native_default_and_foreign_backends() -> None:
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v4.nvidia.model import _select_dsv4_attn_cls
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    for backend in (
+        None,
+        AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4,
+        AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,
+    ):
+        config = SimpleNamespace(
+            attention_config=SimpleNamespace(backend=backend),
+            cache_config=SimpleNamespace(cache_dtype="nvfp4_ds_mla"),
+        )
+        with pytest.raises(ValueError, match="B12X_MLA_SPARSE"):
+            _select_dsv4_attn_cls(config)
+
+
+def test_dsv4_selector_binds_native_to_b12x_attention() -> None:
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v4.nvidia.b12x import DeepseekV4B12xMLAAttention
+    from vllm.models.deepseek_v4.nvidia.model import _select_dsv4_attn_cls
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(
+            backend=AttentionBackendEnum.B12X_MLA_SPARSE
+        ),
+        cache_config=SimpleNamespace(cache_dtype="nvfp4_ds_mla"),
+    )
+    assert _select_dsv4_attn_cls(config) is DeepseekV4B12xMLAAttention
+
+
 def test_b12x_cache_page_view_native_preserves_padded_stride() -> None:
     page_size = 2
     payload_bytes = page_size * 432

@@ -41,6 +41,39 @@ class Nvfp4MlaCacheFormat:
                 f"{NVFP4_MLA_DYNAMIC_SCALE_ENV}=1 requires {KV_FP8_ROPE_ENV}=1"
             )
 
+    def validate_dsv4_native(self, *, outer_scale: float = 1.0) -> None:
+        """Reject native DSV4 modes not implemented by the 432-byte ABI."""
+        self.validate()
+        if self.dynamic_scale or self.scales_file or self.fp8_rope:
+            raise ValueError(
+                "native DSV4 nvfp4_ds_mla requires dynamic_scale=false, "
+                "no scales file, and fp8_rope=false"
+            )
+        if float(outer_scale) != 1.0:
+            raise ValueError(
+                "native DSV4 nvfp4_ds_mla requires identity outer scale 1.0, "
+                f"got {outer_scale!r}"
+            )
+
+    def validate_dsv4_native_across_ranks(self, *, outer_scale: float = 1.0) -> None:
+        """Validate identity mode and reject rank-divergent environment state."""
+        local = (self.dynamic_scale, self.fp8_rope, self.scales_file, float(outer_scale))
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                gathered: list[tuple[bool, bool, str, float] | None] = [
+                    None
+                ] * dist.get_world_size()
+                dist.all_gather_object(gathered, local)
+                if any(value != local for value in gathered):
+                    raise ValueError(
+                        "native DSV4 NVFP4 ABI configuration differs across ranks"
+                    )
+        except (RuntimeError, ValueError):
+            raise
+        self.validate_dsv4_native(outer_scale=outer_scale)
+
     def record_abi(self, cache_dtype: str) -> str:
         """Return an identity suitable for persistent external-cache keys."""
         normalized_dtype = str(cache_dtype).replace("torch.", "")

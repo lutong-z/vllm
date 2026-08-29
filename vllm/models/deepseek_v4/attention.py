@@ -48,6 +48,9 @@ from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.mla_cache_format import (
+    NVFP4_MLA_CACHE_FORMAT,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
@@ -75,6 +78,114 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 
+def _native_dsv4_writer_capability() -> int:
+    """Return the compiled DSV4 writer ABI version or fail closed."""
+    namespace = getattr(torch.ops, "_C", None)
+    capability = getattr(
+        namespace, "fused_deepseek_v4_nvfp4_writer_capability", None
+    )
+    if capability is None:
+        raise ValueError(
+            "native DSV4 nvfp4_ds_mla requires the compiled writer capability op"
+        )
+    try:
+        version = int(capability())
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "native DSV4 nvfp4_ds_mla writer capability op failed to load"
+        ) from exc
+    if version != 1:
+        raise ValueError(
+            "native DSV4 nvfp4_ds_mla writer ABI is unavailable "
+            f"(reported version {version})"
+        )
+    for name in (
+        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out",
+    ):
+        op = getattr(namespace, name, None)
+        schemas = getattr(op, "_schemas", None)
+        if isinstance(schemas, dict):
+            schema_values = schemas.values()
+        elif schemas is None:
+            schema_values = ()
+        else:
+            schema_values = schemas
+        schema_text = " ".join(str(schema) for schema in schema_values)
+        if "use_nvfp4" not in schema_text:
+            raise ValueError(
+                f"native DSV4 nvfp4_ds_mla writer schema {name!r} "
+                "does not expose use_nvfp4"
+            )
+
+
+    return version
+
+
+def _native_dsv4_writer_capability_across_ranks() -> int:
+    """Require one compiled writer ABI on every participating rank."""
+    local_version = 0
+    local_error: str | None = None
+    try:
+        local_version = _native_dsv4_writer_capability()
+    except ValueError as exc:
+        local_error = str(exc)
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            gathered: list[tuple[int, str | None] | None] = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, (local_version, local_error))
+            if any(item != gathered[0] for item in gathered[1:]):
+                raise ValueError(
+                    "native DSV4 NVFP4 writer ABI differs across ranks"
+                )
+            if gathered[0] is not None:
+                local_version, local_error = gathered[0]
+    except (RuntimeError, ValueError):
+        raise
+    if local_error is not None:
+        raise ValueError(local_error)
+    return local_version
+
+def _validate_dsv4_writer_indices(
+    slot_mapping: torch.Tensor,
+    position_ids: torch.Tensor,
+    *,
+    cache_pages: int,
+    cache_block_size: int,
+    max_position: int,
+) -> None:
+    """Check slot and RoPE bounds before the fused writer dereferences them."""
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return
+    if slot_mapping.numel():
+        slot_min = int(slot_mapping.min().item())
+        slot_max = int(slot_mapping.max().item())
+        if slot_min < -1:
+            raise ValueError(
+                "DSV4 slot_mapping accepts only non-negative slots or -1 sentinel"
+            )
+        capacity = int(cache_pages) * int(cache_block_size)
+        if slot_max >= capacity:
+            raise ValueError(
+                f"DSV4 slot_mapping contains slot {slot_max} outside "
+                f"cache capacity {capacity}"
+            )
+    if position_ids.numel():
+        position_min = int(position_ids.min().item())
+        position_max = int(position_ids.max().item())
+        if position_min < 0 or position_max >= int(max_position):
+            raise ValueError(
+                f"DSV4 position_ids must be in [0, {int(max_position)}), got "
+                f"[{position_min}, {position_max}]"
+            )
+
+
+
+
+
+
 @triton.jit
 def _fill_short_context_topk_indices(
     output,
@@ -98,10 +209,24 @@ def _resolve_dsv4_kv_cache_dtype(
     use_fp8_ds_mla_layout: bool,
     kv_cache_dtype: str,
     cache_config: CacheConfig | None,
+    *,
+    backend_cls: type[AttentionBackend] | None = None,
 ) -> tuple[str, torch.dtype]:
     """Resolve DSV4 cache dtype and verify native readers before allocation."""
     if use_fp8_ds_mla_layout:
         if kv_cache_dtype == "nvfp4_ds_mla":
+            if backend_cls is not None:
+                from vllm.models.deepseek_v4.nvidia.b12x import (
+                    DeepseekV4B12xMLASparseBackend,
+                )
+
+                if backend_cls is not DeepseekV4B12xMLASparseBackend:
+                    raise ValueError(
+                        "native DSV4 nvfp4_ds_mla is bound to "
+                        "DeepseekV4B12xMLAAttention/B12X_MLA_SPARSE; "
+                        f"got {backend_cls.__name__}"
+                    )
+            NVFP4_MLA_CACHE_FORMAT.validate_dsv4_native_across_ranks()
             try:
                 from b12x.attention.compressed_mla import supports_dsv4_nvfp4
             except (ImportError, ModuleNotFoundError) as exc:
@@ -114,6 +239,7 @@ def _resolve_dsv4_kv_cache_dtype(
                     "native DSV4 nvfp4_ds_mla reader is unavailable for the "
                     "active device/package; refusing to allocate a 432-byte cache"
                 )
+            _native_dsv4_writer_capability_across_ranks()
             logger.info_once(
                 "Using DeepSeek's native 432-byte NVFP4 MLA KV cache format."
             )
@@ -376,7 +502,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Resolve the kv-cache dtype from this backend's block format. The same
         # resolution drives the SWA cache tensor dtype below.
         self.kv_cache_dtype, self.kv_cache_torch_dtype = _resolve_dsv4_kv_cache_dtype(
-            self._uses_fp8_ds_mla_layout(), cache_config.cache_dtype, cache_config
+            self._uses_fp8_ds_mla_layout(),
+            cache_config.cache_dtype,
+            cache_config,
+            backend_cls=self.backend_cls,
         )
 
         self.swa_cache_layer = DeepseekV4SWACache(
@@ -909,6 +1038,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # native DSV4 path writes the 432-byte E2M1/E4M3 record.
             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
             use_nvfp4 = self.kv_cache_dtype == "nvfp4_ds_mla"
+            _validate_dsv4_writer_indices(
+                swa_metadata.slot_mapping,
+                positions,
+                cache_pages=int(swa_kv_cache.shape[0]),
+                cache_block_size=int(swa_metadata.block_size),
+                max_position=int(cos_sin_cache.shape[0]),
+            )
             if self.eager_scratch_pool is not None:
                 q_out = self.eager_scratch_pool.q_out(q.shape[0])
                 torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(

@@ -839,13 +839,25 @@ class DeepseekV4MoE(nn.Module):
 def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     """Pick the CUDA sparse-MLA attention class for the configured backend.
 
-    The generic CUDA backend selector does not instantiate DSv4 layers directly,
-    so map generic sparse-MLA choices to the DSv4-specialized attention class.
-    Without an explicit backend, SM12 defaults to FlashInfer while the other
-    CUDA arches keep the FlashMLA path. Select ``B12X_MLA_SPARSE`` explicitly
-    to use the b12x DSv4 sparse-MLA path.
+    Native ``nvfp4_ds_mla`` is a model-specific ABI: it is valid only with
+    ``DeepseekV4B12xMLAAttention`` and its ``B12X_MLA_SPARSE`` backend. Do this
+    check before constructing the layer, and therefore before KV-cache
+    allocation, instead of allowing the generic SM12 default to select
+    FlashInfer.
     """
     backend = vllm_config.attention_config.backend
+    cache_config = getattr(vllm_config, "cache_config", None)
+    native_nvfp4 = (
+        cache_config is not None
+        and getattr(cache_config, "cache_dtype", None) == "nvfp4_ds_mla"
+    )
+    if native_nvfp4 and backend != AttentionBackendEnum.B12X_MLA_SPARSE:
+        backend_name = getattr(backend, "name", backend)
+        raise ValueError(
+            "nvfp4_ds_mla requires DeepseekV4B12xMLAAttention/"
+            f"B12X_MLA_SPARSE before allocation; got backend={backend_name!r}"
+        )
+
     device_capability = current_platform.get_device_capability()
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
@@ -857,6 +869,11 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
             "sparse MLA."
         )
     if backend == AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4:
+        if native_nvfp4:
+            raise ValueError(
+                "nvfp4_ds_mla rejects explicit FlashInfer DSV4 routing; "
+                "pin B12X_MLA_SPARSE"
+            )
         if device_capability is not None and device_capability.major == 12:
             return DeepseekV4FlashInferSM120Attention
         return DeepseekV4FlashInferMLAAttention
@@ -866,8 +883,18 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         AttentionBackendEnum.FLASHMLA_SPARSE,
         AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,
     ):
+        if native_nvfp4:
+            raise ValueError(
+                "nvfp4_ds_mla rejects explicit FlashMLA routing; "
+                "pin B12X_MLA_SPARSE"
+            )
         return DeepseekV4FlashMLAAttention
 
+    if native_nvfp4:
+        raise ValueError(
+            "nvfp4_ds_mla requires an explicit B12X_MLA_SPARSE backend; "
+            "unset/default routing is rejected"
+        )
     if device_capability is not None and device_capability.major == 12:
         return DeepseekV4FlashInferSM120Attention
     return DeepseekV4FlashMLAAttention

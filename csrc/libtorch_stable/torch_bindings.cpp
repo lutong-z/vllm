@@ -433,6 +433,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "bool is_neox, Tensor position_ids, "
       "int forced_token_heads_per_warp=-1) -> ()");
 
+  ops.def("fused_deepseek_v4_nvfp4_writer_capability() -> int");
+
   ops.def(
       "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert("
       "Tensor q_in, Tensor kv, Tensor! k_cache, "
@@ -762,6 +764,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   // Positional encoding kernels (shared CUDA/ROCm)
   ops.impl("rotary_embedding", TORCH_BOX(&rotary_embedding));
   ops.impl("fused_qk_norm_rope", TORCH_BOX(&fused_qk_norm_rope));
+  ops.impl("fused_deepseek_v4_nvfp4_writer_capability",
+           TORCH_BOX(&fused_deepseek_v4_nvfp4_writer_capability));
   ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
            TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert));
   ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out",

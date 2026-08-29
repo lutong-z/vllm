@@ -2515,26 +2515,33 @@ class VllmConfig:
         if self.model_config is None:
             return self
         if (
-            not self.cache_config.cache_dtype.startswith("nvfp4")
+            self.cache_config.cache_dtype != "nvfp4_ds_mla"
             or not self.model_config.use_mla
         ):
             return self
         model_type = getattr(
             getattr(self.model_config, "hf_config", None), "model_type", None
         )
-        if (
-            self.cache_config.cache_dtype != "nvfp4_ds_mla"
-            or model_type not in {"deepseek_v4", "deepseek_mtp"}
-        ):
+        if model_type not in {"deepseek_v4", "deepseek_mtp"}:
             raise ValueError(
                 "nvfp4 KV cache is supported only for native DSV4 "
                 "nvfp4_ds_mla with the capability-gated B12X reader; "
-                f"got dtype={self.cache_config.cache_dtype!r}, model_type={model_type!r}"
+                f"got model_type={model_type!r}"
+            )
+        from vllm.model_executor.layers.mla_cache_format import (
+            NVFP4_MLA_CACHE_FORMAT,
+        )
+
+        NVFP4_MLA_CACHE_FORMAT.validate_dsv4_native_across_ranks()
+        backend = getattr(self.attention_config, "backend", None)
+        backend_name = getattr(backend, "name", backend)
+        if backend_name != "B12X_MLA_SPARSE":
+            raise ValueError(
+                "nvfp4_ds_mla requires DeepseekV4B12xMLAAttention/"
+                f"B12X_MLA_SPARSE before allocation; got backend={backend_name!r}"
             )
         # The DeepSeek attention resolver performs the device/package capability
-        # probe before allocating pages. Keeping this validator model-specific
-        # avoids a dtype-only global allow-list while allowing configuration
-        # inspection on hosts without CUDA.
+        # and compiled-writer probes before allocating pages.
         return self
 
     @model_validator(mode="after")

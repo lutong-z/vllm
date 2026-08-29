@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, ClassVar, Literal, cast
 import torch
 
 from vllm.config import VllmConfig
+from vllm.config.cache import CacheDType
+from vllm.platforms.interface import DeviceCapability
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.common.ops import (
     compute_dcp_global_topk_indices_and_lens,
@@ -101,18 +103,62 @@ def _dsv4_b12x_page_nbytes(page_size: int, cache_dtype: str) -> int:
     return int(page_size) * record_bytes
 
 
+def _validate_cache_storage_bounds(
+    cache: torch.Tensor,
+    *,
+    name: str,
+) -> None:
+    if cache.numel() == 0:
+        return
+    min_offset = int(cache.storage_offset())
+    max_offset = min_offset
+    for size, stride in zip(cache.shape, cache.stride(), strict=True):
+        extent = (int(size) - 1) * int(stride)
+        if extent >= 0:
+            max_offset += extent
+        else:
+            min_offset += extent
+    storage_elems = cache.untyped_storage().nbytes() // cache.element_size()
+    if min_offset < 0 or max_offset >= storage_elems:
+        raise RuntimeError(
+            f"{name} view is outside its storage: shape={tuple(cache.shape)} "
+            f"stride={tuple(cache.stride())} storage_offset={int(cache.storage_offset())}"
+        )
+
+
+
+
 def _b12x_cache_page_view(
     cache: torch.Tensor,
     page_size: int,
     name: str,
     cache_dtype: str,
 ) -> torch.Tensor:
-    page_nbytes = _dsv4_b12x_page_nbytes(page_size, cache_dtype)
-    if page_nbytes <= 0:
+    page_size = int(page_size)
+    if page_size <= 0:
         raise ValueError(f"{name} page_size must be positive, got {page_size}")
-
+    if cache_dtype not in {"fp8_ds_mla", "nvfp4_ds_mla"}:
+        raise ValueError(
+            f"{name} unsupported DSV4 cache dtype {cache_dtype!r}; "
+            "expected fp8_ds_mla or nvfp4_ds_mla"
+        )
+    record_bytes = (
+        _DSV4_NVFP4_CACHE_BYTES_PER_TOKEN
+        if cache_dtype == "nvfp4_ds_mla"
+        else _DSV4_FP8_CACHE_BYTES_PER_TOKEN
+    )
+    page_nbytes = page_size * record_bytes
     byte_cache = cache if cache.dtype == torch.uint8 else cache.view(torch.uint8)
+    _validate_cache_storage_bounds(byte_cache, name=name)
+    if byte_cache.ndim < 2 or int(byte_cache.shape[0]) <= 0:
+        raise RuntimeError(f"{name} must contain at least one cache page")
     if byte_cache.ndim == 2:
+        padded_page_nbytes = ((page_nbytes + 575) // 576) * 576
+        if int(byte_cache.shape[1]) not in (page_nbytes, padded_page_nbytes):
+            raise RuntimeError(
+                f"{name} logical page width must be {page_nbytes} or padded "
+                f"{padded_page_nbytes}, got {int(byte_cache.shape[1])}"
+            )
         if int(byte_cache.shape[1]) < page_nbytes:
             raise RuntimeError(
                 f"{name} page width {int(byte_cache.shape[1])} is smaller than "
@@ -130,11 +176,16 @@ def _b12x_cache_page_view(
             )
         return byte_cache[:, :page_nbytes]
 
-    if byte_cache.ndim < 2:
+    if byte_cache.ndim != 3 or int(byte_cache.shape[1]) != page_size:
         raise RuntimeError(
-            f"{name} expected a paged cache tensor, got shape {tuple(cache.shape)}"
+            f"{name} expected [pages, {page_size}, {record_bytes}] cache, "
+            f"got shape {tuple(cache.shape)}"
         )
-
+    if int(byte_cache.shape[2]) != record_bytes:
+        raise RuntimeError(
+            f"{name} logical record width must be exactly {record_bytes} bytes, "
+            f"got {int(byte_cache.shape[2])}"
+        )
     pages = int(byte_cache.shape[0])
     page_stride_nbytes = int(byte_cache.stride(0))
     if page_stride_nbytes < page_nbytes:
@@ -142,26 +193,20 @@ def _b12x_cache_page_view(
             f"{name} page stride {page_stride_nbytes} is smaller than DSV4 page "
             f"payload {page_nbytes}"
         )
+    if int(byte_cache.stride(2)) != 1 or int(byte_cache.stride(1)) != record_bytes:
+        raise RuntimeError(
+            f"{name} page payload must be contiguous, got stride "
+            f"{tuple(byte_cache.stride())}"
+        )
 
-    expected_stride = 1
-    for dim in range(byte_cache.ndim - 1, 0, -1):
-        if int(byte_cache.stride(dim)) != expected_stride:
-            raise RuntimeError(
-                f"{name} page payload must be contiguous, got stride "
-                f"{tuple(byte_cache.stride())}"
-            )
-        expected_stride *= int(byte_cache.shape[dim])
-
-    # Packed DS4 KV cache views have a storage offset for this layer and a
-    # larger per-block stride for the whole packed block. Expose only the
-    # logical payload while preserving stride(0), so SparkInfer can use the
-    # physical block stride without materializing/copying.
-    page_view = torch.as_strided(
+    # Packed DSV4 KV cache views retain a larger physical block stride while
+    # exposing exactly the logical records consumed by B12X.
+    return torch.as_strided(
         byte_cache,
         size=(pages, page_nbytes),
         stride=(page_stride_nbytes, 1),
     )
-    return page_view
+
 
 
 def _b12x_cache_page_view_key(
@@ -496,17 +541,54 @@ def _run_dcp_compressed_mla(
 
 
 class DeepseekV4B12xMLASparseBackend(DeepseekV4FlashMLABackend):
-    """b12x compressed sparse-MLA backend for DeepSeek-V4 (SM120 / SM121).
+    """Native B12X sparse-MLA backend for DeepSeek-V4 on SM12x.
 
-    Geometry is identical to the FlashMLA parent (``fp8_ds_mla`` 584 B page,
-    head 512, block 64) -- it inherits ``get_kv_cache_shape`` /
-    ``get_supported_head_sizes``; only the impl class differs.
+    The semantic DSV4 head is 512 values, but native NVFP4 owns a physical
+    432-byte record per token. Keep that distinction in this backend so cache
+    allocation and every packed page view use the same ABI.
     """
+
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "fp8_ds_mla",
+        "nvfp4_ds_mla",
+        "fp8",
+    ]
 
     @staticmethod
     def get_name() -> str:
-        return "V4_B12X_SPARSE"
+        return "B12X_MLA_SPARSE"
 
+    @classmethod
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+        return capability.major == 12
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int]:
+        return [64]
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        if cache_dtype_str == "nvfp4_ds_mla":
+            if num_kv_heads != 1:
+                raise ValueError(
+                    "native DSV4 B12X cache requires exactly one KV head"
+                )
+            return (num_blocks, block_size, _DSV4_NVFP4_CACHE_BYTES_PER_TOKEN)
+        return DeepseekV4FlashMLABackend.get_kv_cache_shape(
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            head_size,
+            cache_dtype_str,
+        )
 
 class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
     """b12x compressed sparse-MLA attention layer for DeepSeek-V4 (SM120)."""

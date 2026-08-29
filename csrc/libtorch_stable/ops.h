@@ -268,6 +268,8 @@ void fused_qk_norm_rope(torch::stable::Tensor& qkv, int64_t num_heads_q,
                         torch::stable::Tensor& position_ids,
                         int64_t forced_token_heads_per_warp);
 
+int64_t fused_deepseek_v4_nvfp4_writer_capability();
+
 torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     torch::stable::Tensor const& q_in, torch::stable::Tensor const& kv,
     torch::stable::Tensor& k_cache, torch::stable::Tensor const& slot_mapping,

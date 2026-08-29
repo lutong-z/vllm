@@ -63,6 +63,41 @@ def test_invalid_dynamic_combinations_fail_closed(cache_format):
         cache_format.validate()
 
 
+
+@pytest.mark.parametrize(
+    ("dynamic_scale", "fp8_rope", "scales_file"),
+    [(True, False, ""), (False, True, ""), (False, False, "/tmp/scales.json")],
+)
+def test_dsv4_native_accepts_identity_mode_only(
+    dynamic_scale, fp8_rope, scales_file
+):
+    cache_format = Nvfp4MlaCacheFormat(
+        dynamic_scale=dynamic_scale,
+        fp8_rope=fp8_rope,
+        scales_file=scales_file,
+    )
+    with pytest.raises(ValueError, match="identity|dynamic_scale|scales file"):
+        cache_format.validate_dsv4_native()
+
+
+def test_dsv4_native_rejects_non_identity_outer_scale():
+    cache_format = Nvfp4MlaCacheFormat(
+        dynamic_scale=False,
+        fp8_rope=False,
+        scales_file="",
+    )
+    with pytest.raises(ValueError, match="identity outer scale"):
+        cache_format.validate_dsv4_native(outer_scale=0.5)
+
+
+def test_dsv4_native_identity_mode_is_valid():
+    cache_format = Nvfp4MlaCacheFormat(
+        dynamic_scale=False,
+        fp8_rope=False,
+        scales_file="",
+    )
+    cache_format.validate_dsv4_native()
+
 def test_static_scale_contents_participate_in_record_abi(tmp_path):
     scales = tmp_path / "scales.json"
     payload = b'{"format":"example","scales":[1.0]}'

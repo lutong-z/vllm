@@ -26,6 +26,7 @@ ONE ``get_simultaneous`` call so they never alias.
 """
 
 import inspect
+import math
 import os
 import weakref
 from dataclasses import dataclass
@@ -2397,6 +2398,17 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
     def _b12x_kernel_format_kwargs(self, latent_scale: float = 1.0) -> dict[str, Any]:
         if self._b12x_scale_format is None:
             return {}
+        if (
+            self.kv_cache_dtype == "nvfp4_ds_mla"
+            and not _is_glm_moe_dsa_model()
+            and (
+                not math.isfinite(float(latent_scale))
+                or float(latent_scale) != 1.0
+            )
+        ):
+            raise RuntimeError(
+                "native DSV4 nvfp4_ds_mla requires finite identity outer scale 1.0"
+            )
         if self._nvfp4_dynamic_scale:
             if float(latent_scale) != 1.0:
                 raise RuntimeError(
