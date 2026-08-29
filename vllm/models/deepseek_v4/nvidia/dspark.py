@@ -269,6 +269,18 @@ def _insert_context_kv(
     block_size = attn.swa_cache_layer.block_size
     cos_sin_cache = attn.rotary_emb.cos_sin_cache
     cache_dtype = swa_cache.dtype
+    if cache_dtype == torch.uint8:
+        from vllm.models.deepseek_v4.attention import (
+            _validate_dsv4_writer_indices,
+        )
+
+        _validate_dsv4_writer_indices(
+            slot_mapping,
+            positions,
+            cache_pages=int(swa_cache.shape[0]),
+            cache_block_size=int(block_size),
+            max_position=int(cos_sin_cache.shape[0]),
+        )
     n_ctx = kv.shape[0]
     dummy_q = torch.zeros(
         (n_ctx, attn.n_local_heads, attn.head_dim),

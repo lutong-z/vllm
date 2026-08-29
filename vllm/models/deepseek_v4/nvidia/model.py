@@ -851,6 +851,15 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         cache_config is not None
         and getattr(cache_config, "cache_dtype", None) == "nvfp4_ds_mla"
     )
+    if native_nvfp4:
+        from vllm.model_executor.layers.mla_cache_format import (
+            NVFP4_MLA_CACHE_FORMAT,
+        )
+
+        backend_name = getattr(backend, "name", backend)
+        NVFP4_MLA_CACHE_FORMAT.validate_dsv4_native_across_ranks(
+            identity=str(backend_name)
+        )
     if native_nvfp4 and backend != AttentionBackendEnum.B12X_MLA_SPARSE:
         backend_name = getattr(backend, "name", backend)
         raise ValueError(

@@ -55,20 +55,35 @@ class Nvfp4MlaCacheFormat:
                 f"got {outer_scale!r}"
             )
 
-    def validate_dsv4_native_across_ranks(self, *, outer_scale: float = 1.0) -> None:
-        """Validate identity mode and reject rank-divergent environment state."""
-        local = (self.dynamic_scale, self.fp8_rope, self.scales_file, float(outer_scale))
+    def validate_dsv4_native_across_ranks(
+        self,
+        *,
+        outer_scale: float = 1.0,
+        identity: str | None = None,
+    ) -> None:
+        """Collect identity state before any rank raises for native DSV4."""
+        local = (
+            self.dynamic_scale,
+            self.fp8_rope,
+            self.scales_file,
+            float(outer_scale),
+            identity,
+        )
         try:
             import torch.distributed as dist
 
             if dist.is_available() and dist.is_initialized():
-                gathered: list[tuple[bool, bool, str, float] | None] = [
-                    None
-                ] * dist.get_world_size()
+                gathered: list[tuple[object, ...] | None] = [None] * dist.get_world_size()
                 dist.all_gather_object(gathered, local)
-                if any(value != local for value in gathered):
+                normalized = [value for value in gathered if value is not None]
+                if not normalized or any(value != normalized[0] for value in normalized[1:]):
+                    details = "; ".join(
+                        f"rank={rank}:{value!r}"
+                        for rank, value in enumerate(gathered)
+                    )
                     raise ValueError(
-                        "native DSV4 NVFP4 ABI configuration differs across ranks"
+                        "native DSV4 NVFP4 ABI configuration differs across ranks: "
+                        f"{details}"
                     )
         except (RuntimeError, ValueError):
             raise

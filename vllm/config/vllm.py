@@ -2532,9 +2532,11 @@ class VllmConfig:
             NVFP4_MLA_CACHE_FORMAT,
         )
 
-        NVFP4_MLA_CACHE_FORMAT.validate_dsv4_native_across_ranks()
         backend = getattr(self.attention_config, "backend", None)
         backend_name = getattr(backend, "name", backend)
+        NVFP4_MLA_CACHE_FORMAT.validate_dsv4_native_across_ranks(
+            identity=str(backend_name)
+        )
         if backend_name != "B12X_MLA_SPARSE":
             raise ValueError(
                 "nvfp4_ds_mla requires DeepseekV4B12xMLAAttention/"

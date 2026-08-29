@@ -270,6 +270,61 @@ def test_nvfp4_kv_record_matches_432_byte_contract():
     ).item() > 0.99
 
 
+def test_invalid_position_zeroes_q_and_native_cache_row():
+    device = "cuda"
+    q = torch.ones(1, 1, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    kv = torch.ones(1, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    positions = torch.tensor([-1], dtype=torch.int64, device=device)
+    cos_sin = make_cos_sin_cache(8, ROPE_DIM, torch.float32, device)
+    cache = torch.full(
+        (1, 64, 432), 0xA5, dtype=torch.uint8, device=device
+    )
+    slot_mapping = torch.tensor([0], dtype=torch.int64, device=device)
+
+    output = _call_fused(
+        q,
+        8,
+        kv,
+        cache.view(1, -1),
+        slot_mapping,
+        positions,
+        cos_sin,
+        1e-6,
+        64,
+        use_nvfp4=True,
+    )
+    assert torch.count_nonzero(output) == 0
+    assert torch.count_nonzero(cache[0, 0]) == 0
+    assert torch.all(cache[0, 1:] == 0xA5)
+
+
+def test_out_of_capacity_slot_masks_cache_insert():
+    device = "cuda"
+    q = torch.ones(1, 1, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    kv = torch.ones(1, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    positions = torch.tensor([1], dtype=torch.int64, device=device)
+    cos_sin = make_cos_sin_cache(8, ROPE_DIM, torch.float32, device)
+    cache = torch.full(
+        (1, 64, 432), 0xA5, dtype=torch.uint8, device=device
+    )
+    slot_mapping = torch.tensor([64], dtype=torch.int64, device=device)
+
+    output = _call_fused(
+        q,
+        8,
+        kv,
+        cache.view(1, -1),
+        slot_mapping,
+        positions,
+        cos_sin,
+        1e-6,
+        64,
+        use_nvfp4=True,
+    )
+    assert torch.isfinite(output.float()).all()
+    assert torch.all(cache == 0xA5)
+
+
 def _as_stored_fp8(t: torch.Tensor) -> torch.Tensor:
     """Reinterpret a float8_e4m3fn-typed kernel output under the real (FNUZ on
     gfx942) encoding the kernel actually wrote, without touching the bytes."""

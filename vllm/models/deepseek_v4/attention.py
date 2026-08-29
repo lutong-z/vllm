@@ -122,31 +122,121 @@ def _native_dsv4_writer_capability() -> int:
     return version
 
 
-def _native_dsv4_writer_capability_across_ranks() -> int:
-    """Require one compiled writer ABI on every participating rank."""
-    local_version = 0
-    local_error: str | None = None
+def _probe_native_dsv4_identity(
+    backend_cls: type[AttentionBackend] | None,
+) -> None:
+    """Collect native ABI status before any rank raises or allocates."""
+    backend_name = (
+        None
+        if backend_cls is None
+        else f"{backend_cls.__module__}.{backend_cls.__qualname__}"
+    )
+    backend_error: str | None = None
+    if backend_cls is None or not backend_name.endswith(
+        "DeepseekV4B12xMLASparseBackend"
+    ):
+        backend_error = (
+            "backend must be DeepseekV4B12xMLAAttention/B12X_MLA_SPARSE"
+        )
+    format_state = (
+        NVFP4_MLA_CACHE_FORMAT.dynamic_scale,
+        NVFP4_MLA_CACHE_FORMAT.fp8_rope,
+        NVFP4_MLA_CACHE_FORMAT.scales_file,
+    )
+    format_error: str | None = None
     try:
-        local_version = _native_dsv4_writer_capability()
-    except ValueError as exc:
-        local_error = str(exc)
+        NVFP4_MLA_CACHE_FORMAT.validate_dsv4_native()
+    except Exception as exc:
+        format_error = str(exc)
+
+    reader_ok = False
+    reader_error: str | None = None
+    try:
+        from b12x.attention.compressed_mla import supports_dsv4_nvfp4
+
+        reader_ok = bool(supports_dsv4_nvfp4())
+        if not reader_ok:
+            reader_error = "B12X native DSV4 reader capability is unavailable"
+    except Exception as exc:
+        reader_error = f"B12X reader probe failed: {exc}"
+
+    writer_version = 0
+    writer_error: str | None = None
+    try:
+        writer_version = _native_dsv4_writer_capability()
+    except Exception as exc:
+        writer_error = str(exc)
+
+    local = (
+        backend_name,
+        backend_error,
+        format_state,
+        format_error,
+        reader_ok,
+        reader_error,
+        writer_version,
+        writer_error,
+    )
     try:
         import torch.distributed as dist
 
         if dist.is_available() and dist.is_initialized():
-            gathered: list[tuple[int, str | None] | None] = [None] * dist.get_world_size()
-            dist.all_gather_object(gathered, (local_version, local_error))
-            if any(item != gathered[0] for item in gathered[1:]):
-                raise ValueError(
-                    "native DSV4 NVFP4 writer ABI differs across ranks"
+            gathered: list[tuple[object, ...] | None] = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, local)
+            normalized = [item for item in gathered if item is not None]
+            if not normalized or any(item != normalized[0] for item in normalized[1:]):
+                details = "; ".join(
+                    f"rank={rank}:{item!r}" for rank, item in enumerate(gathered)
                 )
-            if gathered[0] is not None:
-                local_version, local_error = gathered[0]
+                raise ValueError(
+                    "native DSV4 NVFP4 ABI identity differs across ranks: "
+                    f"{details}"
+                )
+            local = normalized[0]
     except (RuntimeError, ValueError):
         raise
-    if local_error is not None:
-        raise ValueError(local_error)
-    return local_version
+
+    (
+        _backend_name,
+        backend_error,
+        _format_state,
+        format_error,
+        reader_ok,
+        reader_error,
+        writer_version,
+        writer_error,
+    ) = local
+    errors: list[str] = []
+    if backend_error is not None:
+        errors.append(backend_error)
+    if format_error is not None:
+        errors.append(format_error)
+    if not reader_ok and reader_error is not None:
+        errors.append(reader_error)
+    if writer_version != 1 and writer_error is not None:
+        errors.append(writer_error)
+    if errors:
+        raise ValueError(
+            "native DSV4 NVFP4 capability check failed: "
+            + "; ".join(sorted(errors))
+        )
+
+def _assert_capture_safe(condition: torch.Tensor, message: str) -> None:
+    condition = condition.all()
+    if (
+        condition.device.type == "cuda"
+        and torch.cuda.is_available()
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        assert_async = getattr(torch, "_assert_async", None)
+        if assert_async is None:
+            torch._assert(condition, message)
+        else:
+            assert_async(condition, message)
+        return
+    if not bool(condition.item()):
+        raise ValueError(message)
+
 
 def _validate_dsv4_writer_indices(
     slot_mapping: torch.Tensor,
@@ -156,30 +246,39 @@ def _validate_dsv4_writer_indices(
     cache_block_size: int,
     max_position: int,
 ) -> None:
-    """Check slot and RoPE bounds before the fused writer dereferences them."""
-    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-        return
-    if slot_mapping.numel():
-        slot_min = int(slot_mapping.min().item())
-        slot_max = int(slot_mapping.max().item())
-        if slot_min < -1:
-            raise ValueError(
-                "DSV4 slot_mapping accepts only non-negative slots or -1 sentinel"
-            )
-        capacity = int(cache_pages) * int(cache_block_size)
-        if slot_max >= capacity:
-            raise ValueError(
-                f"DSV4 slot_mapping contains slot {slot_max} outside "
-                f"cache capacity {capacity}"
-            )
-    if position_ids.numel():
-        position_min = int(position_ids.min().item())
-        position_max = int(position_ids.max().item())
-        if position_min < 0 or position_max >= int(max_position):
-            raise ValueError(
-                f"DSV4 position_ids must be in [0, {int(max_position)}), got "
-                f"[{position_min}, {position_max}]"
-            )
+    """Validate and sanitize writer indices without capture-time host sync."""
+    if slot_mapping.ndim != 1 or slot_mapping.dtype != torch.int64:
+        raise TypeError("DSV4 slot_mapping must be rank-1 int64")
+    if position_ids.ndim != 1 or position_ids.dtype != torch.int64:
+        raise TypeError("DSV4 position_ids must be rank-1 int64")
+    if not slot_mapping.is_contiguous() or not position_ids.is_contiguous():
+        raise ValueError("DSV4 writer index tensors must be contiguous")
+    if slot_mapping.device != position_ids.device:
+        raise ValueError("DSV4 writer indices must share a device")
+    if int(cache_pages) <= 0 or int(cache_block_size) <= 0:
+        raise ValueError("DSV4 writer cache capacity must be positive")
+    if int(max_position) <= 0:
+        raise ValueError("DSV4 writer RoPE position capacity must be positive")
+    capacity = int(cache_pages) * int(cache_block_size)
+    slot_valid = (slot_mapping >= -1) & (slot_mapping < capacity)
+    position_valid = (position_ids >= 0) & (position_ids < int(max_position))
+    capturing = (
+        slot_mapping.device.type == "cuda"
+        and torch.cuda.is_available()
+        and torch.cuda.is_current_stream_capturing()
+    )
+    if capturing:
+        slot_mapping.masked_fill_(~slot_valid, -1)
+        # C++ treats -1 as a deterministic zero/masked row, avoiding stale q_out.
+        position_ids.masked_fill_(~position_valid, -1)
+    _assert_capture_safe(
+        slot_valid,
+        f"DSV4 slot_mapping must be -1 or in [0, {capacity})",
+    )
+    _assert_capture_safe(
+        position_valid,
+        f"DSV4 position_ids must be in [0, {int(max_position)})",
+    )
 
 
 
@@ -215,31 +314,7 @@ def _resolve_dsv4_kv_cache_dtype(
     """Resolve DSV4 cache dtype and verify native readers before allocation."""
     if use_fp8_ds_mla_layout:
         if kv_cache_dtype == "nvfp4_ds_mla":
-            if backend_cls is not None:
-                from vllm.models.deepseek_v4.nvidia.b12x import (
-                    DeepseekV4B12xMLASparseBackend,
-                )
-
-                if backend_cls is not DeepseekV4B12xMLASparseBackend:
-                    raise ValueError(
-                        "native DSV4 nvfp4_ds_mla is bound to "
-                        "DeepseekV4B12xMLAAttention/B12X_MLA_SPARSE; "
-                        f"got {backend_cls.__name__}"
-                    )
-            NVFP4_MLA_CACHE_FORMAT.validate_dsv4_native_across_ranks()
-            try:
-                from b12x.attention.compressed_mla import supports_dsv4_nvfp4
-            except (ImportError, ModuleNotFoundError) as exc:
-                raise ValueError(
-                    "native DSV4 nvfp4_ds_mla requires b12x's public "
-                    "supports_dsv4_nvfp4 capability"
-                ) from exc
-            if not supports_dsv4_nvfp4():
-                raise ValueError(
-                    "native DSV4 nvfp4_ds_mla reader is unavailable for the "
-                    "active device/package; refusing to allocate a 432-byte cache"
-                )
-            _native_dsv4_writer_capability_across_ranks()
+            _probe_native_dsv4_identity(backend_cls)
             logger.info_once(
                 "Using DeepSeek's native 432-byte NVFP4 MLA KV cache format."
             )

@@ -232,10 +232,56 @@ __device__ __forceinline__ void processDeepseekV4Slot(
     int const kv_block_stride, int64_t const cache_capacity,
     bool const use_nvfp4) {
   int64_t const position = position_ids[tokenIdx];
-  if (position < 0 || position >= max_position) return;
-  using Converter = vllm::_typeConvert<scalar_t_in>;
   bool const isKV = (slotIdx == kNumHeadsQPadded);
   bool const isPadQ = !isKV && (slotIdx >= num_heads_q);
+  int64_t const slot_id = isKV ? slot_mapping[tokenIdx] : -1;
+  bool const valid_slot = slot_id >= 0 && slot_id < cache_capacity;
+  if (position < 0 || position >= max_position) {
+    if (!isKV) {
+      scalar_t_in* dst =
+          q_out +
+          (static_cast<int64_t>(tokenIdx) * kNumHeadsQPadded + slotIdx) *
+              kHeadDim +
+          dim_base;
+      uint4 const zero4 = {0u, 0u, 0u, 0u};
+      *reinterpret_cast<uint4*>(dst) = zero4;
+      *reinterpret_cast<uint4*>(dst + 8) = zero4;
+    } else if (valid_slot) {
+      int64_t const block_idx = slot_id / cache_block_size;
+      int64_t const pos_in_block = slot_id % cache_block_size;
+      uint8_t* block_base =
+          k_cache + block_idx * static_cast<int64_t>(kv_block_stride);
+      if (use_nvfp4) {
+#ifndef USE_ROCM
+        if (laneId < 27) {
+          uint8_t* record = block_base + pos_in_block * 432;
+          uint4 const zero4 = {0u, 0u, 0u, 0u};
+          *reinterpret_cast<uint4*>(record + laneId * 16) = zero4;
+        }
+#endif
+      } else {
+        uint8_t* token = block_base + pos_in_block * kTokenDataBytes;
+        uint4 const zero4 = {0u, 0u, 0u, 0u};
+        if (laneId < 28) {
+          *reinterpret_cast<uint4*>(token + laneId * 16) = zero4;
+        } else {
+          uint8_t* rope = token + kNopeDim + (laneId - 28) * 32;
+          *reinterpret_cast<uint4*>(rope) = zero4;
+          *reinterpret_cast<uint4*>(rope + 16) = zero4;
+        }
+        if (laneId == 0) {
+          uint32_t* scale = reinterpret_cast<uint32_t*>(
+              block_base + static_cast<int64_t>(cache_block_size) *
+                                kTokenDataBytes +
+              pos_in_block * kScaleBytesPerToken);
+          scale[0] = 0u;
+          scale[1] = 0u;
+        }
+      }
+    }
+    return;
+  }
+  using Converter = vllm::_typeConvert<scalar_t_in>;
 
   // ── Pad-Q branch: write 32 B of zeros and exit. ─────────────────────────
   // FlashMLA reads these slots; bf16 +0.0 is bit pattern 0x0000, so a uint4

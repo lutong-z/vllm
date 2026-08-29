@@ -201,6 +201,34 @@ def test_dspark_context_insert_passes_native_selector(monkeypatch: pytest.Monkey
     assert calls[0][-1] is True
 
 
+def test_native_probe_collects_rank_mismatch_before_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch.distributed as dist
+
+    import vllm.models.deepseek_v4.attention as dsv4_attention
+
+    monkeypatch.setattr(
+        dsv4_attention,
+        "_native_dsv4_writer_capability",
+        lambda: 1,
+    )
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+
+    def fake_all_gather(
+        output: list[tuple[object, ...] | None],
+        value: tuple[object, ...],
+    ) -> None:
+        output[0] = value
+        output[1] = (*value[:-1], "rank-specific-writer-error")
+
+    monkeypatch.setattr(dist, "all_gather_object", fake_all_gather)
+    with pytest.raises(ValueError, match="differs across ranks"):
+        dsv4_attention._probe_native_dsv4_identity(None)
+
+
 def test_hybrid_swa_contract_keeps_format_explicit() -> None:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
 
