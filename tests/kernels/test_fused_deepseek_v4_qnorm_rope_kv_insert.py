@@ -233,6 +233,20 @@ def test_sm121_software_e2m1_pack_matches_reference():
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
+def test_sm121_software_e2m1_normalizes_signed_zero():
+    zeroes = torch.tensor(
+        [-0.0, 0.0, -0.0, 0.0, -0.0, 0.0, -0.0, 0.0],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    output = torch.empty(4, dtype=torch.uint8, device="cuda")
+    _pack_e2m1_kernel[(1,)](
+        zeroes[::2], zeroes[1::2], output, width=4
+    )
+    expected = torch.zeros(4, dtype=torch.uint8, device="cuda")
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
 def test_nvfp4_kv_record_matches_432_byte_contract():
     torch.manual_seed(17)
     device = "cuda"
@@ -268,6 +282,30 @@ def test_nvfp4_kv_record_matches_432_byte_contract():
     assert torch.nn.functional.cosine_similarity(
         dequant, rotated.float(), dim=0
     ).item() > 0.99
+
+
+def test_native_writer_normalizes_signed_zero_bytes():
+    device = "cuda"
+    q = torch.full((1, 1, HEAD_DIM), -0.0, dtype=torch.bfloat16, device=device)
+    kv = torch.full((1, HEAD_DIM), -0.0, dtype=torch.bfloat16, device=device)
+    positions = torch.tensor([1], dtype=torch.int64, device=device)
+    cos_sin = make_cos_sin_cache(8, ROPE_DIM, torch.float32, device)
+    cache = torch.zeros((1, 64, 432), dtype=torch.uint8, device=device)
+    slot_mapping = torch.tensor([0], dtype=torch.int64, device=device)
+
+    _call_fused(
+        q,
+        8,
+        kv,
+        cache.view(1, -1),
+        slot_mapping,
+        positions,
+        cos_sin,
+        1e-6,
+        64,
+        use_nvfp4=True,
+    )
+    assert torch.count_nonzero(cache[0, :288]) == 0
 
 
 def test_invalid_position_zeroes_q_and_native_cache_row():
@@ -327,13 +365,19 @@ def test_out_of_capacity_slot_masks_cache_insert():
 
 
 
+@pytest.mark.parametrize("target", ["q", "kv"])
 @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -float("inf")])
-def test_nonfinite_native_inputs_are_zeroed_not_finite_packed(bad_value: float):
+def test_single_lane_nonfinite_native_inputs_are_zeroed(
+    target: str,
+    bad_value: float,
+):
     device = "cuda"
-    q = torch.full(
-        (1, 1, HEAD_DIM), bad_value, dtype=torch.bfloat16, device=device
-    )
-    kv = torch.full((1, HEAD_DIM), bad_value, dtype=torch.bfloat16, device=device)
+    q = torch.ones((1, 1, HEAD_DIM), dtype=torch.bfloat16, device=device)
+    kv = torch.ones((1, HEAD_DIM), dtype=torch.bfloat16, device=device)
+    if target == "q":
+        q[0, 0, 0] = bad_value
+    else:
+        kv[0, 0] = bad_value
     positions = torch.tensor([1], dtype=torch.int64, device=device)
     cos_sin = make_cos_sin_cache(8, ROPE_DIM, torch.float32, device)
     cache = torch.full(
@@ -354,9 +398,13 @@ def test_nonfinite_native_inputs_are_zeroed_not_finite_packed(bad_value: float):
         use_nvfp4=True,
     )
     assert torch.isfinite(output.float()).all()
-    assert torch.count_nonzero(output) == 0
-    assert torch.count_nonzero(cache[0, 0]) == 0
-    assert torch.all(cache[0, 1:] == 0xA5)
+    if target == "q":
+        assert torch.count_nonzero(output) == 0
+        assert torch.count_nonzero(cache[0, 0]) > 0
+    else:
+        assert torch.count_nonzero(output) > 0
+        assert torch.count_nonzero(cache[0, 0]) == 0
+
 
 def _as_stored_fp8(t: torch.Tensor) -> torch.Tensor:
     """Reinterpret a float8_e4m3fn-typed kernel output under the real (FNUZ on

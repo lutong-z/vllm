@@ -325,7 +325,9 @@ __device__ __forceinline__ void processDeepseekV4Slot(
   for (int i = 0; i < kElemsPerLane; i++) {
     values_finite = values_finite && isfinite(elements[i]);
   }
-  if (!values_finite) {
+  bool const warp_values_finite =
+      __all_sync(FINAL_MASK, values_finite);
+  if (!warp_values_finite) {
     if (!isKV) {
       scalar_t_in* dst =
           q_out +
@@ -420,7 +422,9 @@ __device__ __forceinline__ void processDeepseekV4Slot(
   for (int i = 0; i < kElemsPerLane; i++) {
     post_rope_finite = post_rope_finite && isfinite(elements[i]);
   }
-  if (!post_rope_finite) {
+  bool const warp_post_rope_finite =
+      __all_sync(FINAL_MASK, post_rope_finite);
+  if (!warp_post_rope_finite) {
     if (!isKV) {
       scalar_t_in* dst =
           q_out +

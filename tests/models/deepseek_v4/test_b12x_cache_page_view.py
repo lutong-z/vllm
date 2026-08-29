@@ -78,7 +78,7 @@ def test_b12x_cache_page_view_native_432_geometry() -> None:
     assert view.stride() == (page_size * 432, 1)
 
 
-@pytest.mark.parametrize("page_size", [4, 128])
+@pytest.mark.parametrize("page_size", [64, 2])
 def test_b12x_cache_page_view_native_c4_c128_allocator_geometry(
     page_size: int,
 ) -> None:
@@ -96,13 +96,56 @@ def test_b12x_cache_page_view_native_c4_c128_allocator_geometry(
     assert view.stride() == (page_size * 432, 1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("page_size", [64, 2])
+def test_native_allocator_zero_writer_page_view_c4_c128(page_size: int) -> None:
+    from vllm.models.deepseek_v4.nvidia.b12x import (
+        DeepseekV4B12xMLASparseBackend,
+    )
+
+    op = getattr(
+        torch.ops._C,
+        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+        None,
+    )
+    if op is None:
+        pytest.skip("compiled DSV4 writer is unavailable")
+    shape = DeepseekV4B12xMLASparseBackend.get_kv_cache_shape(
+        2, page_size, 1, 512, "nvfp4_ds_mla"
+    )
+    cache = torch.empty(shape, dtype=torch.uint8, device="cuda")
+    cache.zero_()
+    q = torch.ones((1, 1, 512), dtype=torch.bfloat16, device="cuda")
+    kv = torch.ones((1, 512), dtype=torch.bfloat16, device="cuda")
+    positions = torch.zeros((1,), dtype=torch.int64, device="cuda")
+    slots = torch.zeros((1,), dtype=torch.int64, device="cuda")
+    cos_sin = torch.ones((8, 64), dtype=torch.float32, device="cuda")
+    op(
+        q,
+        kv,
+        cache.view(shape[0], -1),
+        slots,
+        positions,
+        cos_sin,
+        8,
+        1e-6,
+        page_size,
+        True,
+    )
+    view = _b12x_cache_page_view(
+        cache, page_size, "native", "nvfp4_ds_mla"
+    )
+    assert view.shape == (2, page_size * 432)
+    assert torch.count_nonzero(cache[0, 0]) > 0
+
+
 def test_b12x_cache_page_view_rejects_native_semantic_512_width() -> None:
     cache = torch.empty((2, 64, 512), dtype=torch.uint8)
     with pytest.raises(RuntimeError, match="logical record width"):
         _b12x_cache_page_view(cache, 64, "native", "nvfp4_ds_mla")
 
 
-@pytest.mark.parametrize("page_size", [4, 128])
+@pytest.mark.parametrize("page_size", [64, 2])
 def test_b12x_cache_page_view_preserves_fp8_c4_c128_payload(
     page_size: int,
 ) -> None:

@@ -7,6 +7,7 @@ DeepseekV4 MLA Attention Layer
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
+import os
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
@@ -223,16 +224,18 @@ def _probe_native_dsv4_identity(
 
 def _assert_capture_safe(condition: torch.Tensor, message: str) -> None:
     condition = condition.all()
-    if (
-        condition.device.type == "cuda"
-        and torch.cuda.is_available()
-        and torch.cuda.is_current_stream_capturing()
-    ):
+    if condition.device.type == "cuda":
         assert_async = getattr(torch, "_assert_async", None)
         if assert_async is None:
             torch._assert(condition, message)
         else:
             assert_async(condition, message)
+        if (
+            os.getenv("VLLM_NVFP4_DEBUG_METADATA") == "1"
+            and not torch.cuda.is_current_stream_capturing()
+            and not bool(condition.item())
+        ):
+            raise ValueError(message)
         return
     if not bool(condition.item()):
         raise ValueError(message)
@@ -262,15 +265,6 @@ def _validate_dsv4_writer_indices(
     capacity = int(cache_pages) * int(cache_block_size)
     slot_valid = (slot_mapping >= -1) & (slot_mapping < capacity)
     position_valid = (position_ids >= 0) & (position_ids < int(max_position))
-    capturing = (
-        slot_mapping.device.type == "cuda"
-        and torch.cuda.is_available()
-        and torch.cuda.is_current_stream_capturing()
-    )
-    if capturing:
-        slot_mapping.masked_fill_(~slot_valid, -1)
-        # C++ treats -1 as a deterministic zero/masked row, avoiding stale q_out.
-        position_ids.masked_fill_(~position_valid, -1)
     _assert_capture_safe(
         slot_valid,
         f"DSV4 slot_mapping must be -1 or in [0, {capacity})",

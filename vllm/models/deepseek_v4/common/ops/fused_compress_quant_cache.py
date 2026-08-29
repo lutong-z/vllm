@@ -19,8 +19,9 @@ even/odd halves, producing (N_QUANT_BLOCKS, MXFP4_BLOCK/2) packed nibbles
 and N_QUANT_BLOCKS ue8m0 bytes.
 """
 
-from functools import lru_cache
 import math
+import os
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -34,19 +35,22 @@ def _validate_writer_finite_inputs(
     *tensors: torch.Tensor,
     capturing: bool,
 ) -> None:
-    """Reject nonfinite values before any FP8/NVFP4 finite packing."""
+    """Guard finite packing without an eager host synchronization."""
+    debug = os.getenv("VLLM_NVFP4_DEBUG_FINITE") == "1"
+    if tensors[0].device.type != "cuda" and not debug:
+        return
     finite = torch.ones((), dtype=torch.bool, device=tensors[0].device)
     for tensor in tensors:
         if tensor.device != finite.device:
             raise ValueError("Triton writer inputs must share a device")
         finite = finite & torch.isfinite(tensor).all()
-    if capturing:
-        assert_async = getattr(torch, "_assert_async", None)
+    assert_async = getattr(torch, "_assert_async", None)
+    if finite.device.type == "cuda":
         if assert_async is None:
             torch._assert(finite, "Triton NVFP4 writer received nonfinite input")
         else:
             assert_async(finite, "Triton NVFP4 writer received nonfinite input")
-    elif not bool(finite.item()):
+    if debug and not capturing and not bool(finite.item()):
         raise ValueError("Triton NVFP4 writer received nonfinite input")
 
 
