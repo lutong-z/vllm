@@ -66,9 +66,14 @@ def test_invalid_dynamic_combinations_fail_closed(cache_format):
 
 @pytest.mark.parametrize(
     ("dynamic_scale", "fp8_rope", "scales_file"),
-    [(True, False, ""), (False, True, ""), (False, False, "/tmp/scales.json")],
+    [
+        (True, False, ""),
+        (False, True, ""),
+        (False, False, "/tmp/scales.json"),
+        (True, True, "/tmp/scales.json"),
+    ],
 )
-def test_dsv4_native_accepts_identity_mode_only(
+def test_dsv4_native_rejects_non_identity_modes(
     dynamic_scale, fp8_rope, scales_file
 ):
     cache_format = Nvfp4MlaCacheFormat(
@@ -76,7 +81,13 @@ def test_dsv4_native_accepts_identity_mode_only(
         fp8_rope=fp8_rope,
         scales_file=scales_file,
     )
-    with pytest.raises(ValueError, match="identity|dynamic_scale|scales file"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"^native DSV4 nvfp4_ds_mla requires dynamic_scale=false, "
+            r"no scales file, and fp8_rope=false$"
+        ),
+    ):
         cache_format.validate_dsv4_native()
 
 

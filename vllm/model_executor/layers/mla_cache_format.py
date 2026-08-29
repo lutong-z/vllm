@@ -43,12 +43,12 @@ class Nvfp4MlaCacheFormat:
 
     def validate_dsv4_native(self, *, outer_scale: float = 1.0) -> None:
         """Reject native DSV4 modes not implemented by the 432-byte ABI."""
-        self.validate()
         if self.dynamic_scale or self.scales_file or self.fp8_rope:
             raise ValueError(
                 "native DSV4 nvfp4_ds_mla requires dynamic_scale=false, "
                 "no scales file, and fp8_rope=false"
             )
+        self.validate()
         if float(outer_scale) != 1.0:
             raise ValueError(
                 "native DSV4 nvfp4_ds_mla requires identity outer scale 1.0, "
