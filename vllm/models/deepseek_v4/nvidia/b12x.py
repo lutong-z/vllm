@@ -52,7 +52,6 @@ _DSV4_HEAD_DIM = 512
 _DSV4_V_HEAD_DIM = 512
 _DSV4_FP8_CACHE_BYTES_PER_TOKEN = 584
 _DSV4_NVFP4_CACHE_BYTES_PER_TOKEN = 432
-_DSV4_CACHE_PAD_ALIGNMENT_BYTES = 576
 _DECODE_SPLIT_TILE = 64
 _C128A_TOPK_ALIGNMENT = 128
 _VALIDATE_DCP_INDICES_ENV = "VLLM_DSV4_DCP_VALIDATE_INDICES"
@@ -88,18 +87,18 @@ def _validate_compressed_mla_decode_row_capacity(
         )
 
 
-def _cdiv(x: int, y: int) -> int:
-    return (int(x) + int(y) - 1) // int(y)
-
-
 def _dsv4_b12x_page_nbytes(page_size: int, cache_dtype: str) -> int:
-    if cache_dtype == "nvfp4_ds_mla":
-        return int(page_size) * _DSV4_NVFP4_CACHE_BYTES_PER_TOKEN
-    payload_nbytes = int(page_size) * _DSV4_FP8_CACHE_BYTES_PER_TOKEN
-    return (
-        _cdiv(payload_nbytes, _DSV4_CACHE_PAD_ALIGNMENT_BYTES)
-        * _DSV4_CACHE_PAD_ALIGNMENT_BYTES
+    """Return the logical DSV4 payload bytes in one cache page.
+
+    Physical padding is carried by the tensor's page stride and allocator
+    metadata; this view exposes only the contiguous records consumed by B12X.
+    """
+    record_bytes = (
+        _DSV4_NVFP4_CACHE_BYTES_PER_TOKEN
+        if cache_dtype == "nvfp4_ds_mla"
+        else _DSV4_FP8_CACHE_BYTES_PER_TOKEN
     )
+    return int(page_size) * record_bytes
 
 
 def _b12x_cache_page_view(
