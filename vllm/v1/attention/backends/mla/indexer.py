@@ -763,6 +763,35 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 dtype=torch.int64,
                 device=self.device,
             )
+        self._b12x_virtual_blocks_per_page = 1
+        self._b12x_physical_block_table_buffers: dict[str, torch.Tensor] = {}
+        if self.compress_ratio > 1 and self.use_b12x_sparse_indexer:
+            manager_block_size = int(self.vllm_config.cache_config.block_size)
+            kernel_block_size = int(self.kv_cache_spec.block_size)
+            if manager_block_size % kernel_block_size != 0:
+                raise ValueError(
+                    "DeepSeek V4 manager block size must be divisible by "
+                    f"the kernel block size={kernel_block_size}"
+                )
+            self._b12x_virtual_blocks_per_page = (
+                manager_block_size // kernel_block_size
+            )
+            if block_table_width % self._b12x_virtual_blocks_per_page != 0:
+                raise ValueError(
+                    "DeepSeek V4 expanded block-table width must be divisible by "
+                    f"V={self._b12x_virtual_blocks_per_page}"
+                )
+            physical_block_table_width = (
+                block_table_width // self._b12x_virtual_blocks_per_page
+            )
+            shape = (
+                scheduler_config.max_num_batched_tokens,
+                physical_block_table_width,
+            )
+            self._b12x_physical_block_table_buffers = {
+                "prefill": torch.empty(shape, dtype=torch.int32, device=self.device),
+                "decode": torch.empty(shape, dtype=torch.int32, device=self.device),
+            }
 
         # Pre-allocate buffers for CUDA graph compatibility when
         if self.compress_ratio > 1:
@@ -773,6 +802,45 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
+
+    def _b12x_physical_block_table(
+        self,
+        expanded_table: torch.Tensor,
+        *,
+        prefill: bool = False,
+    ) -> torch.Tensor:
+        """Collapse expanded manager pages for B12X's physical page contract."""
+        buffer = self._b12x_physical_block_table_buffers[
+            "prefill" if prefill else "decode"
+        ]
+        if expanded_table.ndim != 2:
+            raise ValueError(
+                "B12X physical block-table conversion requires rank-2 input, "
+                f"got shape={tuple(expanded_table.shape)}"
+            )
+        rows, expanded_width = map(int, expanded_table.shape)
+        virtual_blocks_per_page = self._b12x_virtual_blocks_per_page
+        if expanded_width % virtual_blocks_per_page != 0:
+            raise ValueError(
+                "B12X expanded block-table width must be divisible by "
+                f"V={virtual_blocks_per_page}, got {expanded_width}"
+            )
+        physical_width = expanded_width // virtual_blocks_per_page
+        if rows > int(buffer.shape[0]) or physical_width > int(buffer.shape[1]):
+            raise ValueError(
+                "B12X physical block-table buffer is too small: "
+                f"requested=({rows}, {physical_width}), "
+                f"capacity={tuple(buffer.shape)}"
+            )
+        if rows == 0 or physical_width == 0:
+            return buffer[:rows, :physical_width]
+        torch.div(
+            expanded_table[:rows, ::virtual_blocks_per_page],
+            virtual_blocks_per_page,
+            rounding_mode="floor",
+            out=buffer[:rows, :physical_width],
+        )
+        return buffer[:rows, :physical_width]
 
     def _dcp_localize_decode_seq_lens(
         self,
@@ -1257,6 +1325,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     request_offset=num_decodes,
                 )
 
+            prefill_block_table = common_attn_metadata.block_table_tensor
+            if self.compress_ratio > 1 and self.use_b12x_sparse_indexer:
+                prefill_block_table = self._b12x_physical_block_table(
+                    prefill_block_table,
+                    prefill=True,
+                )
+
             chunks = []
             for req_slice, query_slice in chunk_specs:
                 metadata = build_prefill_chunk_metadata(
@@ -1267,7 +1342,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     seq_lens,
                     compressed_seq_lens,
                     compressed_seq_lens_cpu,
-                    common_attn_metadata.block_table_tensor,
+                    prefill_block_table,
                     self.compress_ratio,
                     query_slice=query_slice,
                     skip_kv_gather=query_slice.start > 0,
@@ -1356,6 +1431,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     force_flatten=use_varlen,
                 )
             )
+
+            if self.compress_ratio > 1 and self.use_b12x_sparse_indexer:
+                block_table = self._b12x_physical_block_table(block_table)
 
             seq_lens_is_buffer_view = (use_native and next_n > 1) or (
                 not use_native and (max_decode_len > 1 or use_varlen)
