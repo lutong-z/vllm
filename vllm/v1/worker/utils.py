@@ -151,9 +151,13 @@ class KVBlockZeroer:
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
-            kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
-            assert spec.block_size % kernel_bs == 0
-            ratio = spec.block_size // kernel_bs
+            kernel_bs = (
+                spec.storage_block_size
+                if spec.storage_block_size != spec.block_size
+                else kernel_block_sizes[group.kv_cache_group_id]
+            )
+            assert spec.storage_block_size % kernel_bs == 0
+            ratio = spec.storage_block_size // kernel_bs
             block_dim = group.backend.get_kv_cache_block_dim(
                 kernel_bs,
                 spec.num_kv_heads,
