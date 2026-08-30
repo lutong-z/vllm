@@ -92,6 +92,46 @@ def get_compressed_mla_max_q_chunks(
 
 
 @triton.jit
+def _compressed_physical_slot(
+    compressed_idx,
+    block_table_row_ptr,
+    valid,
+    PHYSICAL_PAGE_SIZE: tl.constexpr,
+    VIRTUAL_BLOCKS_PER_PAGE: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
+):
+    """Map a compressed index to a rank-local physical cache slot."""
+    global_page_size = PHYSICAL_PAGE_SIZE * DCP_WORLD_SIZE
+    page_idx = compressed_idx // global_page_size
+    global_page_offset = compressed_idx - page_idx * global_page_size
+
+    if DCP_WORLD_SIZE == 1:
+        is_local = True
+        local_page_offset = global_page_offset
+    else:
+        is_local = (
+            global_page_offset // CP_KV_CACHE_INTERLEAVE_SIZE
+        ) % DCP_WORLD_SIZE == DCP_RANK
+        local_page_offset = (
+            global_page_offset
+            // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+        ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
+            global_page_offset % CP_KV_CACHE_INTERLEAVE_SIZE
+        )
+
+    virtual_block = tl.load(
+        block_table_row_ptr + page_idx * VIRTUAL_BLOCKS_PER_PAGE,
+        mask=valid & is_local,
+        other=0,
+    ).to(tl.int64)
+    physical_block = virtual_block // VIRTUAL_BLOCKS_PER_PAGE
+    slot_id = physical_block * PHYSICAL_PAGE_SIZE + local_page_offset
+    return slot_id, is_local
+
+
+@triton.jit
 def _compressed_slot_mapping_kernel(
     # [num_tokens]
     slot_mapping_ptr,
@@ -102,9 +142,10 @@ def _compressed_slot_mapping_kernel(
     # [num_reqs, max_num_blocks]
     block_table_ptr,
     block_table_stride,
-    block_size,
     COMPRESS_RATIO: tl.constexpr,
     PAD_ID: tl.constexpr,
+    PHYSICAL_PAGE_SIZE: tl.constexpr,
+    VIRTUAL_BLOCKS_PER_PAGE: tl.constexpr,
     DCP_WORLD_SIZE: tl.constexpr,
     DCP_RANK: tl.constexpr,
     CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
@@ -118,6 +159,7 @@ def _compressed_slot_mapping_kernel(
 
     seq_len = tl.load(seq_lens_ptr + batch_idx)
     start_pos = seq_len - query_len
+    block_table_row_ptr = block_table_ptr + batch_idx * block_table_stride
 
     for i in range(0, query_len, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
@@ -125,32 +167,17 @@ def _compressed_slot_mapping_kernel(
 
         pos = start_pos + i + tl.arange(0, TRITON_BLOCK_SIZE)
         is_valid = (pos + 1) % COMPRESS_RATIO == 0
-        pos_after_compress = pos // COMPRESS_RATIO
-
-        if DCP_WORLD_SIZE == 1:
-            block_ids = pos_after_compress // block_size
-            block_offsets = pos_after_compress % block_size
-            is_local = True
-        else:
-            virtual_block_size = block_size * DCP_WORLD_SIZE
-            block_ids = pos_after_compress // virtual_block_size
-            virtual_block_offsets = pos_after_compress - block_ids * virtual_block_size
-            is_local = (
-                virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
-            ) % DCP_WORLD_SIZE == DCP_RANK
-            block_offsets = (
-                virtual_block_offsets // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
-            ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
-                virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
-            )
-
-        block_numbers = tl.load(
-            block_table_ptr + batch_idx * block_table_stride + block_ids,
-            mask=mask & is_valid & is_local,
-        ).to(tl.int64)
-        slot_ids = block_numbers * block_size + block_offsets
-
-        # NOTE
+        compressed_idx = pos // COMPRESS_RATIO
+        slot_ids, is_local = _compressed_physical_slot(
+            compressed_idx,
+            block_table_row_ptr,
+            mask & is_valid,
+            PHYSICAL_PAGE_SIZE,
+            VIRTUAL_BLOCKS_PER_PAGE,
+            DCP_WORLD_SIZE,
+            DCP_RANK,
+            CP_KV_CACHE_INTERLEAVE_SIZE,
+        )
         slot_ids = tl.where(is_valid & is_local, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + query_start + offset, slot_ids, mask=mask)
 
@@ -160,13 +187,25 @@ def get_compressed_slot_mapping(
     query_start_loc: torch.Tensor,
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,
-    block_size: int,
+    physical_page_size: int,
     compress_ratio: int,
     out: torch.Tensor | None = None,
     dcp_world_size: int = 1,
     dcp_rank: int = 0,
     cp_kv_cache_interleave_size: int = 1,
+    virtual_blocks_per_page: int = 1,
 ) -> torch.Tensor:
+    physical_page_size = int(physical_page_size)
+    virtual_blocks_per_page = int(virtual_blocks_per_page)
+    if physical_page_size <= 0:
+        raise ValueError(
+            f"physical_page_size must be positive, got {physical_page_size}"
+        )
+    if virtual_blocks_per_page <= 0:
+        raise ValueError(
+            "virtual_blocks_per_page must be positive, got "
+            f"{virtual_blocks_per_page}"
+        )
     if out is not None:
         # Guard: for padded / invalid sequences.
         # Negative positions produce bogus block indices that lead to illegal memory
@@ -186,9 +225,10 @@ def get_compressed_slot_mapping(
         seq_lens,
         block_table,
         block_table.stride(0),
-        block_size,
-        compress_ratio,
+        COMPRESS_RATIO=compress_ratio,
         PAD_ID=-1,
+        PHYSICAL_PAGE_SIZE=physical_page_size,
+        VIRTUAL_BLOCKS_PER_PAGE=virtual_blocks_per_page,
         DCP_WORLD_SIZE=dcp_world_size,
         DCP_RANK=dcp_rank,
         CP_KV_CACHE_INTERLEAVE_SIZE=cp_kv_cache_interleave_size,

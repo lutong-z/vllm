@@ -29,6 +29,9 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    _compressed_physical_slot,
+)
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.math_utils import next_power_of_2
 
@@ -441,14 +444,24 @@ def compute_global_topk_indices_and_lens(
     block_size: int,
     is_valid_token: torch.Tensor,
     output_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
+    virtual_blocks_per_page: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map local topk indices to global KV cache slots and count valid entries.
+    """Map local compressed indices to physical KV cache slots.
 
-    Fuses three operations into a single kernel:
-    1. Block-table lookup (local index → global slot id)
-    2. Valid-entry counting (topk_lens per token)
-    3. Masking padding tokens to length 0
+    ``block_size`` is the physical compressed-page size. When the scheduler
+    block table is split into smaller virtual kernel blocks,
+    ``virtual_blocks_per_page`` maps the first virtual entry of each physical
+    page back to its manager block.
     """
+    block_size = int(block_size)
+    virtual_blocks_per_page = int(virtual_blocks_per_page)
+    if block_size <= 0:
+        raise ValueError(f"physical page size must be positive, got {block_size}")
+    if virtual_blocks_per_page <= 0:
+        raise ValueError(
+            "virtual_blocks_per_page must be positive, got "
+            f"{virtual_blocks_per_page}"
+        )
     num_tokens = topk_indices.shape[0]
     if output_buffers is None:
         global_topk_indices = torch.empty_like(topk_indices)
@@ -471,6 +484,7 @@ def compute_global_topk_indices_and_lens(
         block_table.stride(0),
         block_size,
         is_valid_token,
+        VIRTUAL_BLOCKS_PER_PAGE=virtual_blocks_per_page,
         TRITON_BLOCK_SIZE=1024,
     )
     return global_topk_indices, topk_lens
@@ -485,8 +499,18 @@ def compute_dcp_global_topk_indices_and_lens(
     dcp_world_size: int,
     dcp_rank: int,
     cp_kv_cache_interleave_size: int,
+    virtual_blocks_per_page: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Filter global top-k ids to this DCP rank and map them to cache slots."""
+    """Filter global compressed indices to this DCP rank and map to physical slots."""
+    block_size = int(block_size)
+    virtual_blocks_per_page = int(virtual_blocks_per_page)
+    if block_size <= 0:
+        raise ValueError(f"physical page size must be positive, got {block_size}")
+    if virtual_blocks_per_page <= 0:
+        raise ValueError(
+            "virtual_blocks_per_page must be positive, got "
+            f"{virtual_blocks_per_page}"
+        )
     num_tokens = topk_indices.shape[0]
     global_topk_indices = torch.empty_like(topk_indices)
     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
@@ -502,6 +526,7 @@ def compute_dcp_global_topk_indices_and_lens(
         block_table.stride(0),
         block_size,
         is_valid_token,
+        VIRTUAL_BLOCKS_PER_PAGE=virtual_blocks_per_page,
         DCP_WORLD_SIZE=dcp_world_size,
         DCP_RANK=dcp_rank,
         CP_KV_CACHE_INTERLEAVE_SIZE=cp_kv_cache_interleave_size,
@@ -523,12 +548,14 @@ def _compute_global_topk_indices_and_lens_kernel(
     block_table_stride: tl.constexpr,
     block_size: tl.constexpr,
     is_valid_token_ptr,
+    VIRTUAL_BLOCKS_PER_PAGE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     is_valid_token = tl.load(is_valid_token_ptr + token_idx)
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
     safe_req_idx = tl.where(is_valid_token, req_idx, 0)
+    block_table_row_ptr = block_table_ptr + safe_req_idx * block_table_stride
 
     count = tl.zeros((), dtype=tl.int32)
     for i in range(0, topk, TRITON_BLOCK_SIZE):
@@ -541,15 +568,16 @@ def _compute_global_topk_indices_and_lens_kernel(
             other=-1,
         )
         is_valid = local_idx >= 0
-
-        block_indices = local_idx // block_size
-        block_numbers = tl.load(
-            block_table_ptr + safe_req_idx * block_table_stride + block_indices,
-            mask=mask & is_valid,
+        slot_ids, _ = _compressed_physical_slot(
+            local_idx,
+            block_table_row_ptr,
+            mask & is_valid,
+            block_size,
+            VIRTUAL_BLOCKS_PER_PAGE,
+            1,
+            0,
+            1,
         )
-        block_offsets = local_idx % block_size
-
-        slot_ids = block_numbers * block_size + block_offsets
         slot_ids = tl.where(is_valid, slot_ids, -1)
         tl.store(
             global_topk_indices_ptr + token_idx * global_topk_indices_stride + offset,
@@ -575,6 +603,7 @@ def _compute_dcp_global_topk_indices_and_lens_kernel(
     block_table_stride,
     block_size,
     is_valid_token_ptr,
+    VIRTUAL_BLOCKS_PER_PAGE: tl.constexpr,
     DCP_WORLD_SIZE: tl.constexpr,
     DCP_RANK: tl.constexpr,
     CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
@@ -584,9 +613,9 @@ def _compute_dcp_global_topk_indices_and_lens_kernel(
     is_valid_token = tl.load(is_valid_token_ptr + token_idx)
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
     safe_req_idx = tl.where(is_valid_token, req_idx, 0)
+    block_table_row_ptr = block_table_ptr + safe_req_idx * block_table_stride
 
     count = tl.zeros((), dtype=tl.int32)
-    virtual_block_size = block_size * DCP_WORLD_SIZE
     for i in range(0, topk, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
         offset_mask = offset < topk
@@ -597,24 +626,16 @@ def _compute_dcp_global_topk_indices_and_lens_kernel(
             other=-1,
         )
         valid_local = local_idx >= 0
-
-        block_indices = local_idx // virtual_block_size
-        block_numbers = tl.load(
-            block_table_ptr + safe_req_idx * block_table_stride + block_indices,
-            mask=offset_mask & valid_local,
-        ).to(tl.int64)
-
-        virtual_block_offsets = local_idx - block_indices * virtual_block_size
-        is_local = (
-            virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
-        ) % DCP_WORLD_SIZE == DCP_RANK
-        local_block_offsets = (
-            virtual_block_offsets // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
-        ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
-            virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
+        slot_ids, is_local = _compressed_physical_slot(
+            local_idx,
+            block_table_row_ptr,
+            offset_mask & valid_local & is_valid_token,
+            block_size,
+            VIRTUAL_BLOCKS_PER_PAGE,
+            DCP_WORLD_SIZE,
+            DCP_RANK,
+            CP_KV_CACHE_INTERLEAVE_SIZE,
         )
-
-        slot_ids = block_numbers * block_size + local_block_offsets
         valid = offset_mask & valid_local & is_local & is_valid_token
         compact_pos = count + tl.cumsum(valid.to(tl.int32), 0) - 1
         row_base = global_topk_indices_ptr + token_idx * global_topk_indices_stride

@@ -1174,17 +1174,36 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             padded_num_tokens = num_tokens
             if self.pcp_world_size > 1:
                 padded_num_tokens = slot_mapping.shape[0] // self.pcp_world_size
+            if self.compress_ratio > 1:
+                manager_block_size = int(self.vllm_config.cache_config.block_size)
+                kernel_block_size = int(self.kv_cache_spec.block_size)
+                if manager_block_size % self.compress_ratio != 0:
+                    raise ValueError(
+                        "DeepSeek V4 manager block size must be divisible by "
+                        f"compress_ratio={self.compress_ratio}"
+                    )
+                if manager_block_size % kernel_block_size != 0:
+                    raise ValueError(
+                        "DeepSeek V4 manager block size must be divisible by "
+                        f"the kernel block size={kernel_block_size}"
+                    )
+                physical_page_size = manager_block_size // self.compress_ratio
+                virtual_blocks_per_page = manager_block_size // kernel_block_size
+            else:
+                physical_page_size = int(self.kv_cache_spec.block_size)
+                virtual_blocks_per_page = 1
             compressed_slot_mapping = get_compressed_slot_mapping(
                 num_tokens,
                 query_start_loc,
                 seq_lens,
                 block_table,
-                self.kv_cache_spec.storage_block_size,
+                physical_page_size,
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
                 dcp_world_size=self.dcp_world_size if use_dcp_local_kv else 1,
                 dcp_rank=self.dcp_rank if use_dcp_local_kv else 0,
                 cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+                virtual_blocks_per_page=virtual_blocks_per_page,
             )
             if self.pcp_world_size > 1:
                 compressed_slot_mapping = get_pcp_group().all_gather(

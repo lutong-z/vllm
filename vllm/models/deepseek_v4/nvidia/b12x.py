@@ -825,7 +825,28 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
             assert attn_metadata is not None
             assert kv_cache is not None
             assert swa_metadata.is_valid_token is not None
-            block_size = attn_metadata.block_size // compress_ratio
+            manager_block_size = int(vllm_config.cache_config.block_size)
+            kernel_block_size = int(attn_metadata.block_size)
+            if manager_block_size % compress_ratio != 0:
+                raise ValueError(
+                    "DeepSeek V4 manager block size must be divisible by "
+                    f"compress_ratio={compress_ratio}"
+                )
+            if manager_block_size % kernel_block_size != 0:
+                raise ValueError(
+                    "DeepSeek V4 manager block size must be divisible by "
+                    f"the kernel block size={kernel_block_size}"
+                )
+            physical_page_size = int(kv_cache.shape[1])
+            expected_page_size = manager_block_size // compress_ratio
+            if physical_page_size != expected_page_size:
+                raise RuntimeError(
+                    "B12X compressed cache physical page size must equal "
+                    f"manager_block_size/compress_ratio={expected_page_size}, "
+                    f"got {physical_page_size}"
+                )
+            virtual_blocks_per_page = manager_block_size // kernel_block_size
+            block_size = physical_page_size
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
             if compress_ratio == 4:
                 assert topk_indices_buffer is not None
@@ -839,6 +860,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                         dcp_world_size,
                         dcp_rank,
                         vllm_config.parallel_config.cp_kv_cache_interleave_size,
+                        virtual_blocks_per_page=virtual_blocks_per_page,
                     )
                 else:
                     topk_indices, topk_lens = compute_global_topk_indices_and_lens(
@@ -847,11 +869,12 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                         attn_metadata.block_table[:num_decodes],
                         block_size,
                         is_valid,
+                        virtual_blocks_per_page=virtual_blocks_per_page,
                     )
             else:
                 topk_indices = attn_metadata.c128a_global_decode_topk_indices
                 topk_lens = attn_metadata.c128a_decode_topk_lens
-            indexed_page_size = block_size
+            indexed_page_size = physical_page_size
             indexed_k_cache = self._get_b12x_cache_page_view(
                 kv_cache,
                 indexed_page_size,
@@ -945,6 +968,27 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         if not swa_only:
             assert attn_metadata is not None
             assert compressed_k_cache is not None
+            manager_block_size = int(vllm_config.cache_config.block_size)
+            kernel_block_size = int(attn_metadata.block_size)
+            if manager_block_size % compress_ratio != 0:
+                raise ValueError(
+                    "DeepSeek V4 manager block size must be divisible by "
+                    f"compress_ratio={compress_ratio}"
+                )
+            if manager_block_size % kernel_block_size != 0:
+                raise ValueError(
+                    "DeepSeek V4 manager block size must be divisible by "
+                    f"the kernel block size={kernel_block_size}"
+                )
+            physical_page_size = int(compressed_k_cache.shape[1])
+            expected_page_size = manager_block_size // compress_ratio
+            if physical_page_size != expected_page_size:
+                raise RuntimeError(
+                    "B12X compressed cache physical page size must equal "
+                    f"manager_block_size/compress_ratio={expected_page_size}, "
+                    f"got {physical_page_size}"
+                )
+            virtual_blocks_per_page = manager_block_size // kernel_block_size
             if compress_ratio == 4:
                 assert topk_indices_buffer is not None
                 local_topk_indices = topk_indices_buffer[
@@ -957,18 +1001,18 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
             prefill_slice = slice(
                 num_decode_tokens, num_decode_tokens + num_prefill_tokens
             )
-            block_size = attn_metadata.block_size // compress_ratio
             if dcp_world_size > 1:
                 extra_topk_indices, extra_topk_lens = (
                     compute_dcp_global_topk_indices_and_lens(
                         local_topk_indices,
                         swa_metadata.token_to_req_indices[prefill_slice],
                         attn_metadata.block_table,
-                        block_size,
+                        physical_page_size,
                         swa_metadata.is_valid_token[prefill_slice],
                         dcp_world_size,
                         dcp_rank,
                         vllm_config.parallel_config.cp_kv_cache_interleave_size,
+                        virtual_blocks_per_page=virtual_blocks_per_page,
                     )
                 )
             else:
@@ -977,11 +1021,12 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                         local_topk_indices,
                         swa_metadata.token_to_req_indices[prefill_slice],
                         attn_metadata.block_table,
-                        block_size,
+                        physical_page_size,
                         swa_metadata.is_valid_token[prefill_slice],
+                        virtual_blocks_per_page=virtual_blocks_per_page,
                     )
                 )
-            indexed_page_size = block_size
+            indexed_page_size = physical_page_size
             indexed_k_cache = self._get_b12x_cache_page_view(
                 compressed_k_cache,
                 indexed_page_size,
