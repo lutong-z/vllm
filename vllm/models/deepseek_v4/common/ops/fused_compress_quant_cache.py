@@ -20,7 +20,6 @@ and N_QUANT_BLOCKS ue8m0 bytes.
 """
 
 import math
-import os
 from functools import lru_cache
 from typing import Any
 
@@ -29,29 +28,6 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .fused_indexer_q import _fp32x2_to_fp4x2
-
-
-def _validate_writer_finite_inputs(
-    *tensors: torch.Tensor,
-    capturing: bool,
-) -> None:
-    """Guard finite packing without an eager host synchronization."""
-    debug = os.getenv("VLLM_NVFP4_DEBUG_FINITE") == "1"
-    if tensors[0].device.type != "cuda" and not debug:
-        return
-    finite = torch.ones((), dtype=torch.bool, device=tensors[0].device)
-    for tensor in tensors:
-        if tensor.device != finite.device:
-            raise ValueError("Triton writer inputs must share a device")
-        finite = finite & torch.isfinite(tensor).all()
-    assert_async = getattr(torch, "_assert_async", None)
-    if finite.device.type == "cuda":
-        if assert_async is None:
-            torch._assert(finite, "Triton NVFP4 writer received nonfinite input")
-        else:
-            assert_async(finite, "Triton NVFP4 writer received nonfinite input")
-    if debug and not capturing and not bool(finite.item()):
-        raise ValueError("Triton NVFP4 writer received nonfinite input")
 
 
 def compress_norm_rope_store_triton(
@@ -89,17 +65,12 @@ def compress_norm_rope_store_triton(
     """
     if not math.isfinite(float(rms_norm_eps)) or float(rms_norm_eps) <= 0.0:
         raise ValueError("Triton NVFP4 writer requires finite positive RMS epsilon")
-    capturing = (
-        state_cache.device.type == "cuda"
-        and torch.cuda.is_available()
-        and torch.cuda.is_current_stream_capturing()
-    )
-    _validate_writer_finite_inputs(
-        state_cache,
-        rms_norm_weight,
-        cos_sin_cache,
-        capturing=capturing,
-    )
+    if not (
+        state_cache.device
+        == rms_norm_weight.device
+        == cos_sin_cache.device
+    ):
+        raise ValueError("Triton writer inputs must share a device")
     if head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
         num_warps = 4
