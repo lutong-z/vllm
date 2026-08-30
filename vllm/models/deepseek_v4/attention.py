@@ -52,6 +52,9 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.mla_cache_format import (
     NVFP4_MLA_CACHE_FORMAT,
 )
+from vllm.model_executor.layers.sparse_attn_indexer import (
+    use_b12x_sparse_indexer,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
@@ -66,6 +69,7 @@ from vllm.utils.multi_stream_utils import (
 from vllm.utils.torch_utils import current_stream, direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
+    B12xNonCompressedIndexerBackend,
     DeepseekV4IndexerBackend,
     get_max_prefill_buffer_size,
 )
@@ -1366,6 +1370,8 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
     def forward(self): ...
 
     def get_attn_backend(self) -> type[AttentionBackend]:
+        if use_b12x_sparse_indexer():
+            return B12xNonCompressedIndexerBackend
         return DeepseekV4IndexerBackend
 
 
