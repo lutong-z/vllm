@@ -10,6 +10,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
+from itertools import zip_longest
 from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
 
 from vllm import envs
@@ -1991,21 +1992,25 @@ def _get_kv_cache_groups_uniform_groups(
         layers_per_size: dict[int, list[str]] = defaultdict(list)
         for layer_name, layer_spec in sm_spec.kv_cache_specs.items():
             layers_per_size[layer_spec.page_size_bytes].append(layer_name)
-        # NOTE(yifan): for now, inside a UniformKV group, each page_size should
-        # have the same number of layers. This also means we don't need to pad layers
-        # inside a partial-full layer tuple.
-        assert len(set(len(layers) for layers in layers_per_size.values())) == 1
-        num_layers_per_size = len(next(iter(layers_per_size.values())))
+        # Page-size buckets can have different layer counts when target and
+        # draft caches use different physical formats. As with full_mla_group,
+        # keep the final layer tuples partial instead of inventing padding
+        # layers. zip_longest is byte-identical to zip for equal-size buckets.
+        num_layers_per_size = max(len(layers) for layers in layers_per_size.values())
 
         # Split layers inside each UniformKV group for aligned #(layers).
         # See `_get_kv_cache_groups_uniform_page_size` for more details.
         num_tuple_groups = cdiv(num_layers_per_size, num_layer_tuples)
-        layer_tuples = list(zip(*layers_per_size.values()))
+        layer_tuples = list(zip_longest(*layers_per_size.values()))
         for i in range(num_tuple_groups):
             group_layer_tuples = layer_tuples[i::num_tuple_groups]
-            # Flatten tuples and build dict for from_specs
+            # Flatten tuples and build dict for from_specs. Missing entries in
+            # a partial tuple consume no bytes in the packed cache layout.
             group_layer_names = [
-                name for layer_tuple in group_layer_tuples for name in layer_tuple
+                name
+                for layer_tuple in group_layer_tuples
+                for name in layer_tuple
+                if name is not None
             ]
             group_layer_specs = {
                 name: sm_spec.kv_cache_specs[name] for name in group_layer_names
