@@ -200,3 +200,144 @@ def test_window_shift_updates_shared_sequence_length_once_for_two_groups():
     assert seq_lens.item() == draft_kv_window
     for table, original in zip(tables, originals, strict=True):
         torch.testing.assert_close(table[0, :4], original[0, 4:8])
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_aligned_prefix_metadata_matches_shifted_draft_table():
+    """Restored whole blocks are removed without changing logical positions."""
+    device = torch.device("cuda")
+    max_num_reqs = 1
+    max_num_tokens = 8
+    num_speculative_steps = 2
+    num_query_per_req = 3
+    num_context_tokens = 2
+    padded_context_tokens = 4
+
+    input_buffers = SimpleNamespace(
+        input_ids=torch.zeros(max_num_tokens, dtype=torch.int64, device=device),
+        positions=torch.zeros(max_num_tokens, dtype=torch.int64, device=device),
+        query_start_loc=torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device),
+        seq_lens=torch.zeros(max_num_reqs, dtype=torch.int32, device=device),
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_scheduled_tokens=np.array([num_context_tokens], dtype=np.int32),
+        positions=torch.tensor(
+            [BLOCK_SIZE, BLOCK_SIZE + 1], dtype=torch.int64, device=device
+        ),
+        query_start_loc=torch.tensor(
+            [0, num_context_tokens], dtype=torch.int32, device=device
+        ),
+        idx_mapping=torch.zeros(1, dtype=torch.int32, device=device),
+    )
+    block_table = torch.tensor([[11, 12, 13, 14]], dtype=torch.int32, device=device)
+    num_cached_tokens = torch.tensor([BLOCK_SIZE], dtype=torch.int32, device=device)
+    query_slots = torch.full(
+        (max_num_tokens,), -1, dtype=torch.int64, device=device
+    )
+    context_positions = torch.full_like(query_slots, -1)
+    context_slots = torch.full_like(query_slots, -1)
+    sample_rows = max_num_reqs * num_speculative_steps
+
+    prepare_dflash_inputs(
+        input_buffers,
+        query_slots,
+        context_positions,
+        context_slots,
+        torch.zeros(sample_rows, dtype=torch.int64, device=device),
+        torch.zeros(sample_rows, dtype=torch.int64, device=device),
+        torch.full((sample_rows,), -1, dtype=torch.int32, device=device),
+        input_batch,
+        torch.zeros(1, dtype=torch.int32, device=device),
+        torch.zeros(1, dtype=torch.int32, device=device),
+        torch.zeros(max_num_reqs, dtype=torch.int32, device=device),
+        torch.zeros(max_num_reqs, dtype=torch.int32, device=device),
+        block_table,
+        BLOCK_SIZE,
+        num_cached_tokens,
+        1,
+        num_query_per_req,
+        num_speculative_steps,
+        max_num_reqs,
+        max_num_tokens,
+        1024,
+        context_num_tokens_padded=padded_context_tokens,
+    )
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(
+        context_positions[:num_context_tokens],
+        torch.tensor(
+            [BLOCK_SIZE, BLOCK_SIZE + 1], dtype=torch.int64, device=device
+        ),
+    )
+    torch.testing.assert_close(
+        context_slots[:num_context_tokens],
+        torch.tensor(
+            [12 * BLOCK_SIZE, 12 * BLOCK_SIZE + 1],
+            dtype=torch.int64,
+            device=device,
+        ),
+    )
+    torch.testing.assert_close(
+        context_positions[num_context_tokens:padded_context_tokens],
+        torch.zeros(
+            padded_context_tokens - num_context_tokens,
+            dtype=torch.int64,
+            device=device,
+        ),
+    )
+    torch.testing.assert_close(
+        context_slots[num_context_tokens:padded_context_tokens],
+        torch.full(
+            (padded_context_tokens - num_context_tokens,),
+            PAD_SLOT_ID,
+            dtype=torch.int64,
+            device=device,
+        ),
+    )
+    torch.testing.assert_close(
+        input_buffers.positions[:num_query_per_req],
+        torch.tensor(
+            [BLOCK_SIZE + 2, BLOCK_SIZE + 3, BLOCK_SIZE + 4],
+            dtype=torch.int64,
+            device=device,
+        ),
+    )
+    torch.testing.assert_close(
+        query_slots[:num_query_per_req],
+        torch.tensor(
+            [12 * BLOCK_SIZE + 2, 12 * BLOCK_SIZE + 3, 12 * BLOCK_SIZE + 4],
+            dtype=torch.int64,
+            device=device,
+        ),
+    )
+    torch.testing.assert_close(
+        query_slots[num_query_per_req:],
+        torch.full(
+            (max_num_tokens - num_query_per_req,),
+            PAD_SLOT_ID,
+            dtype=torch.int64,
+            device=device,
+        ),
+    )
+    assert input_buffers.seq_lens[0].item() == (
+        num_query_per_req + num_context_tokens
+    )
+
+    shift_draft_block_tables(
+        block_table,
+        input_batch.idx_mapping,
+        num_cached_tokens,
+        input_buffers.seq_lens,
+        BLOCK_SIZE,
+    )
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(
+        block_table[0, :3],
+        torch.tensor([12, 13, 14], dtype=torch.int32, device=device),
+    )
+    assert input_buffers.seq_lens[0].item() == (
+        num_query_per_req + num_context_tokens
+    )

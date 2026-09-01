@@ -54,7 +54,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, MambaSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -480,6 +480,53 @@ class Scheduler(SchedulerInterface):
         )
         return blocks, num_local, shared_prefix_boundary, False
 
+    def _repair_unaligned_dspark_prefix_enabled(self) -> bool:
+        """Whether local prefix hits need DFlash/DSpark draft-KV repair."""
+        speculative_config = self.vllm_config.speculative_config
+        if (
+            not self.cache_config.enable_prefix_caching
+            or speculative_config is None
+            or speculative_config.method not in ("dflash", "dspark")
+            or self.connector is not None
+            or self.dcp_world_size != 1
+            or self.need_mamba_block_aligned_split
+            or getattr(
+                self.kv_cache_manager.coordinator, "enable_partial_hash_hits", False
+            )
+        ):
+            return False
+
+        groups = self.kv_cache_config.kv_cache_groups
+        if (
+            sum(isinstance(group.kv_cache_spec, FullAttentionSpec) for group in groups)
+            != 1
+        ):
+            return False
+
+        return all(
+            self.block_size % manager.block_size == 0
+            for manager in self.kv_cache_manager.coordinator.single_type_managers
+        )
+
+    def _repair_unaligned_dspark_prefix(
+        self,
+        blocks: KVCacheBlocks,
+        num_local_computed_tokens: int,
+    ) -> tuple[KVCacheBlocks, int]:
+        """Recompute a restored partial tail for DFlash/DSpark draft KV."""
+        if not self._repair_unaligned_dspark_prefix_enabled():
+            return blocks, num_local_computed_tokens
+
+        partial_tail = num_local_computed_tokens % self.block_size
+        if partial_tail == 0:
+            return blocks, num_local_computed_tokens
+
+        num_local_computed_tokens -= partial_tail
+        blocks = self.kv_cache_manager.truncate_computed_blocks(
+            blocks, num_local_computed_tokens
+        )
+        return blocks, num_local_computed_tokens
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -807,6 +854,16 @@ class Scheduler(SchedulerInterface):
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
 
+                    # DFlash/DSpark draft KV is derived from target hidden
+                    # states. Recompute an unaligned restored tail through the
+                    # target so every retained draft slot is initialized.
+                    (
+                        new_computed_blocks,
+                        num_new_local_computed_tokens,
+                    ) = self._repair_unaligned_dspark_prefix(
+                        new_computed_blocks,
+                        num_new_local_computed_tokens,
+                    )
                     # Get externally-cached tokens if using a KVConnector.
                     # Even when reads are disabled, call the connector so it
                     # can establish its per-request lifecycle state before
