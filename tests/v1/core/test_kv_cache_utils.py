@@ -1709,6 +1709,9 @@ def _make_dsv4_vllm_config(dcp: int):
 
 def _make_dsv4_heterogeneous_kv_cache_specs(
     cache_dtype: str = "fp8_ds_mla",
+    *,
+    ratios: list[int] | None = None,
+    draft_swa_layers: int = 0,
 ):
     packed_alignment = 432 if cache_dtype == "nvfp4_ds_mla" else 576
 
@@ -1746,6 +1749,18 @@ def _make_dsv4_heterogeneous_kv_cache_specs(
             model_version="deepseek_v4",
         )
 
+    def draft_swa_cache_spec():
+        return SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            sliding_window=128,
+            cache_dtype_str="fp8_ds_mla",
+            alignment=576,
+            model_version="deepseek_v4",
+        )
+
     def compressor_state_spec(compress_ratio: int):
         overlap = compress_ratio == 4
         return SlidingWindowMLASpec(
@@ -1758,23 +1773,30 @@ def _make_dsv4_heterogeneous_kv_cache_specs(
             dcp_sharded=True,
         )
 
-    ratios = [128, 128] + [4, 128] * 29 + [4]
-    assert ratios.count(4) == 30
-    assert ratios.count(128) == 31
+    if ratios is None:
+        ratios = [128, 128] + [4, 128] * 29 + [4]
+        assert ratios.count(4) == 30
+        assert ratios.count(128) == 31
 
     kv_cache_specs: dict[str, KVCacheSpec] = {}
     for layer_idx, ratio in enumerate(ratios):
         prefix = f"layers.{layer_idx}"
-        kv_cache_specs[f"{prefix}.mla_attn"] = full_mla_spec(ratio)
+        if ratio > 1:
+            kv_cache_specs[f"{prefix}.mla_attn"] = full_mla_spec(ratio)
         kv_cache_specs[f"{prefix}.swa_cache"] = swa_cache_spec()
-        kv_cache_specs[f"{prefix}.compressor.state_cache"] = compressor_state_spec(
-            ratio
-        )
-        if ratio == 4:
-            kv_cache_specs[f"{prefix}.indexer.k_cache"] = indexer_spec()
-            kv_cache_specs[f"{prefix}.indexer.compressor.state_cache"] = (
-                compressor_state_spec(ratio)
+        if ratio > 1:
+            kv_cache_specs[f"{prefix}.compressor.state_cache"] = compressor_state_spec(
+                ratio
             )
+            if ratio == 4:
+                kv_cache_specs[f"{prefix}.indexer.k_cache"] = indexer_spec()
+                kv_cache_specs[f"{prefix}.indexer.compressor.state_cache"] = (
+                    compressor_state_spec(ratio)
+                )
+    for draft_idx in range(draft_swa_layers):
+        kv_cache_specs[f"draft.layers.{draft_idx}.swa_cache"] = (
+            draft_swa_cache_spec()
+        )
 
     return kv_cache_specs
 
@@ -1786,7 +1808,7 @@ def _make_dsv4_heterogeneous_kv_cache_groups():
     return kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
 
 
-def test_dsv4_nvfp4_pads_full_mla_anchor_for_compressor_state():
+def test_dsv4_nvfp4_keeps_full_mla_pages_compact():
     specs = _make_dsv4_heterogeneous_kv_cache_specs("nvfp4_ds_mla")
     grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(specs)
     assert grouped_specs is not None
@@ -1795,14 +1817,101 @@ def test_dsv4_nvfp4_pads_full_mla_anchor_for_compressor_state():
 
     full_group = groups[0].kv_cache_spec
     assert isinstance(full_group, UniformTypeKVCacheSpecs)
-    # A logical 64-token NVFP4 page is 64 * 432 = 27,648 bytes. It is
-    # physically padded to the 32 KiB compressor-state page shared by DSV4.
-    assert max(full_group.get_page_sizes()) == 32_768
+    full_specs = full_group.kv_cache_specs
+    c4_pages = [
+        spec.page_size_bytes
+        for spec in full_specs.values()
+        if spec.cache_dtype_str == "nvfp4_ds_mla"
+        and spec.compress_ratio == 4
+        and spec.head_size == 512
+    ]
+    c128_pages = [
+        spec.page_size_bytes
+        for spec in full_specs.values()
+        if spec.cache_dtype_str == "nvfp4_ds_mla"
+        and spec.compress_ratio == 128
+    ]
+    indexer_pages = [
+        spec.page_size_bytes
+        for spec in full_specs.values()
+        if spec.head_size == 132
+    ]
+    assert c4_pages and set(c4_pages) == {27_648}
+    assert c128_pages and set(c128_pages) == {864}
+    assert indexer_pages and set(indexer_pages) == {8_704}
     assert all(
-        max(group.kv_cache_spec.get_page_sizes()) <= 32_768
-        for group in groups
-        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        spec.page_size_padded is None
+        for spec in full_specs.values()
+        if spec.cache_dtype_str == "nvfp4_ds_mla"
     )
+
+
+def test_dsv4_fp8_pages_remain_unchanged():
+    specs = _make_dsv4_heterogeneous_kv_cache_specs("fp8_ds_mla")
+    grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(specs)
+    assert grouped_specs is not None
+
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
+    full_group = groups[0].kv_cache_spec
+    assert isinstance(full_group, UniformTypeKVCacheSpecs)
+    full_specs = full_group.kv_cache_specs
+    assert {
+        spec.page_size_bytes
+        for spec in full_specs.values()
+        if spec.cache_dtype_str == "fp8_ds_mla" and spec.compress_ratio == 4
+    } == {37_440}
+    assert {
+        spec.page_size_bytes
+        for spec in full_specs.values()
+        if spec.cache_dtype_str == "fp8_ds_mla" and spec.compress_ratio == 128
+    } == {1_728}
+    assert {
+        spec.page_size_bytes
+        for spec in full_specs.values()
+        if spec.head_size == 132
+    } == {9_216}
+
+
+def test_dsv4_nvfp4_current_target_draft_group_accounting():
+    ratios = [0, 0, 4, 128] * 10 + [4, 0, 0, 0]
+    specs = _make_dsv4_heterogeneous_kv_cache_specs(
+        "nvfp4_ds_mla",
+        ratios=ratios,
+        draft_swa_layers=3,
+    )
+    assert {
+        spec.page_size_bytes
+        for name, spec in specs.items()
+        if name.startswith("draft.")
+    } == {37_440}
+
+    grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(specs)
+    assert grouped_specs is not None
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
+    group_widths = [
+        sum(
+            group.kv_cache_spec.kv_cache_specs[name].page_size_bytes
+            for name in group.layer_names
+        )
+        for group in groups
+    ]
+    assert sorted(group_widths) == [
+        618_048,
+        655_360,
+        683_136,
+        688_128,
+        688_128,
+        780_672,
+    ]
+    assert max(group_widths) == 780_672
+
+    vllm_config = _make_dsv4_vllm_config(1)
+    num_blocks, tensors = kv_cache_utils._get_kv_cache_config_packed(
+        vllm_config, groups, available_memory=780_672 * 4
+    )
+    assert num_blocks == 4
+    assert {tensor.block_stride for tensor in tensors} == {780_672}
+    assert {tensor.size for tensor in tensors} == {780_672 * 4}
 
 
 def test_dsv4_max_concurrency_uses_uniform_group_pool_math():

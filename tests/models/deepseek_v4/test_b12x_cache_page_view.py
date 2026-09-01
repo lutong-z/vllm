@@ -9,6 +9,9 @@ from vllm.models.deepseek_v4.nvidia.b12x import _b12x_cache_page_view
 _PAGE_SIZE = 64
 _PAYLOAD_BYTES = _PAGE_SIZE * 584
 _PADDED_PAGE_BYTES = 37_440
+_NATIVE_RECORD_BYTES = 432
+_NATIVE_PAGE_BYTES = _PAGE_SIZE * _NATIVE_RECORD_BYTES
+_COMPACT_BLOCK_STRIDE = 780_672
 
 
 def test_b12x_cache_page_view_accepts_contiguous_payload_pages() -> None:
@@ -76,6 +79,33 @@ def test_b12x_cache_page_view_native_432_geometry() -> None:
     view = _b12x_cache_page_view(cache, page_size, "native", "nvfp4_ds_mla")
     assert view.shape == (3, page_size * 432)
     assert view.stride() == (page_size * 432, 1)
+
+
+def test_b12x_cache_page_view_native_432_accepts_compact_block_stride() -> None:
+    storage = torch.empty(2 * _COMPACT_BLOCK_STRIDE, dtype=torch.uint8)
+    cache = torch.as_strided(
+        storage,
+        size=(2, _PAGE_SIZE, _NATIVE_RECORD_BYTES),
+        stride=(_COMPACT_BLOCK_STRIDE, _NATIVE_RECORD_BYTES, 1),
+    )
+
+    view = _b12x_cache_page_view(cache, _PAGE_SIZE, "native", "nvfp4_ds_mla")
+
+    assert view.shape == (2, _NATIVE_PAGE_BYTES)
+    assert view.stride() == (_COMPACT_BLOCK_STRIDE, 1)
+
+
+def test_b12x_cache_page_view_native_432_rejects_short_block_stride() -> None:
+    short_stride = _NATIVE_PAGE_BYTES - 1
+    storage = torch.empty(2 * _NATIVE_PAGE_BYTES, dtype=torch.uint8)
+    cache = torch.as_strided(
+        storage,
+        size=(2, _PAGE_SIZE, _NATIVE_RECORD_BYTES),
+        stride=(short_stride, _NATIVE_RECORD_BYTES, 1),
+    )
+
+    with pytest.raises(RuntimeError, match=r"page stride .* smaller"):
+        _b12x_cache_page_view(cache, _PAGE_SIZE, "native", "nvfp4_ds_mla")
 
 
 @pytest.mark.parametrize("page_size", [64, 2])

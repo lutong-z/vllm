@@ -1914,35 +1914,6 @@ def _get_kv_cache_groups_uniform_groups(
         for spec in full_mla_spec.kv_cache_specs.values()
     )
 
-    # DeepSeek V4's compressor state is a 32 KiB physical page. The stock
-    # FP8 MLA record produces a larger C4 page, so it naturally anchors the
-    # shared tensor. NVFP4 shrinks the C4 payload to 27 KiB; pad that physical
-    # page back up to the largest companion page while retaining its 432-byte
-    # logical record and 64-token storage block. Kernels index the logical
-    # payload through storage_block_size and the allocator owns the padding.
-    full_page_sizes = full_mla_spec.get_page_sizes()
-    companion_page_sizes = [
-        page_size
-        for grouped_spec in grouped_specs[1:]
-        for page_size in grouped_spec.get_page_sizes()
-    ]
-    if companion_page_sizes and max(companion_page_sizes) > max(full_page_sizes):
-        old_anchor = max(full_page_sizes)
-        new_anchor = max(companion_page_sizes)
-        nvfp4_anchor_specs = [
-            spec
-            for spec in full_mla_spec.kv_cache_specs.values()
-            if spec.page_size_bytes == old_anchor
-            and spec.cache_dtype_str == "nvfp4_ds_mla"
-            and spec.model_version == "deepseek_v4"
-        ]
-        assert nvfp4_anchor_specs, (
-            "Companion KV page exceeds the full-MLA anchor for an unsupported "
-            f"layout: companion={sorted(set(companion_page_sizes))}, "
-            f"full={sorted(full_page_sizes)}"
-        )
-        for spec in nvfp4_anchor_specs:
-            object.__setattr__(spec, "page_size_padded", new_anchor)
 
     full_mla_group = KVCacheGroupSpec(
         layer_names=list(full_mla_spec.kv_cache_specs.keys()),
