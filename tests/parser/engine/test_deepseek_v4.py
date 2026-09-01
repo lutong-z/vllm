@@ -253,6 +253,14 @@ class TestThinkingModeConfig:
             ({"thinking": False}, "CONTENT"),
             ({"enable_thinking": False}, "CONTENT"),
             (
+                {
+                    "thinking": True,
+                    "enable_thinking": False,
+                    "reasoning_effort": "high",
+                },
+                "CONTENT",
+            ),
+            (
                 {"enable_thinking": True, "reasoning_effort": "none"},
                 "CONTENT",
             ),
@@ -271,6 +279,7 @@ class TestThinkingModeConfig:
         parser = DeepSeekV4Parser(
             mock_tokenizer, chat_template_kwargs={"thinking": True}
         )
+        assert parser.thinking_enabled
         chunks = [
             "\n\nLet me consider ",
             "this carefully.\n",
@@ -300,6 +309,39 @@ class TestThinkingModeConfig:
             },
         )
         assert p.parser_engine_config.initial_state.name == "CONTENT"
+
+    def test_no_thinking_non_streaming_is_visible_content(self, mock_tokenizer):
+        parser = DeepSeekV4Parser(
+            mock_tokenizer,
+            chat_template_kwargs={
+                "thinking": True,
+                "enable_thinking": False,
+                "reasoning_effort": "high",
+            },
+        )
+
+        reasoning, content = parser.extract_reasoning("DS4-K5-ROCE-OK.", None)
+
+        assert not parser.thinking_enabled
+        assert reasoning is None
+        assert content == "DS4-K5-ROCE-OK."
+
+    def test_no_thinking_streaming_is_visible_content(self, mock_tokenizer):
+        parser = DeepSeekV4Parser(
+            mock_tokenizer,
+            chat_template_kwargs={
+                "thinking": True,
+                "enable_thinking": False,
+                "reasoning_effort": "high",
+            },
+        )
+
+        reasoning, content = simulate_reasoning_streaming(
+            parser, ["DS4-", "K5-ROCE-", "OK."]
+        )
+
+        assert reasoning == ""
+        assert content == "DS4-K5-ROCE-OK."
 
 
 # ── Implicit reasoning end (missing </think> before tool calls) ─────
