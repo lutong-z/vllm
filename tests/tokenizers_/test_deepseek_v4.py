@@ -113,6 +113,18 @@ def test_deepseek_v4_explicitly_disables_thinking(kwargs):
     assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>")
 
 
+def test_deepseek_v4_request_disable_overrides_legacy_thinking_default():
+    prompt = _tokenizer().apply_chat_template(
+        [{"role": "user", "content": "Reply exactly."}],
+        tokenize=False,
+        thinking=True,
+        enable_thinking=False,
+    )
+
+    assert prompt == (
+        "<｜begin▁of▁sentence｜><｜User｜>Reply exactly.<｜Assistant｜></think>"
+    )
+
 def test_deepseek_v4_uses_v4_tool_prompt_from_request_tools():
     tools = [
         {

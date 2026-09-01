@@ -27,10 +27,11 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             tools: list[dict[str, Any]] | None = None,
             **kwargs,
         ) -> str | list[int]:
-            thinking = kwargs.get("thinking")
-            enable_thinking = kwargs.get("enable_thinking")
-            thinking_enabled = bool(thinking) or bool(enable_thinking)
-            if "thinking" not in kwargs and "enable_thinking" not in kwargs:
+            if "enable_thinking" in kwargs:
+                thinking_enabled = bool(kwargs["enable_thinking"])
+            elif "thinking" in kwargs:
+                thinking_enabled = bool(kwargs["thinking"])
+            else:
                 thinking_enabled = True
             thinking_mode = "thinking" if thinking_enabled else "chat"
 
