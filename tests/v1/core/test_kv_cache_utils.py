@@ -1865,11 +1865,14 @@ def test_dsv4_fp8_pages_remain_unchanged():
         for spec in full_specs.values()
         if spec.cache_dtype_str == "fp8_ds_mla" and spec.compress_ratio == 128
     } == {1_728}
+    # 64 indexer rows are 64 * (128 FP8 bytes + 4-byte scale) = 8,448
+    # bytes; the FP8 packing alignment is 576, so the physical page is
+    # ceil(8,448 / 576) * 576 = 8,640 bytes.
     assert {
         spec.page_size_bytes
         for spec in full_specs.values()
         if spec.head_size == 132
-    } == {9_216}
+    } == {8_640}
 
 
 def test_dsv4_nvfp4_current_target_draft_group_accounting():
@@ -1895,23 +1898,30 @@ def test_dsv4_nvfp4_current_target_draft_group_accounting():
         )
         for group in groups
     ]
+    # This helper intentionally models 11 C4 and 10 C128 target layers,
+    # 11 C4 indexers, 44 target SWA layers, and 3 FP8 draft SWA layers.
+    # Keep these widths tied to that helper rather than the separate ADR
+    # projection for a different layer-count table.
     assert sorted(group_widths) == [
-        618_048,
-        655_360,
-        683_136,
-        688_128,
-        688_128,
-        780_672,
+        304_128,
+        327_680,
+        341_568,
+        341_568,
+        341_568,
+        360_448,
+        360_448,
+        408_512,
     ]
-    assert max(group_widths) == 780_672
+    assert max(group_widths) == 408_512
 
     vllm_config = _make_dsv4_vllm_config(1)
     num_blocks, tensors = kv_cache_utils._get_kv_cache_config_packed(
-        vllm_config, groups, available_memory=780_672 * 4
+        vllm_config, groups, available_memory=408_512 * 4
     )
     assert num_blocks == 4
-    assert {tensor.block_stride for tensor in tensors} == {780_672}
-    assert {tensor.size for tensor in tensors} == {780_672 * 4}
+    assert {tensor.block_stride for tensor in tensors} == {408_512}
+    assert {tensor.size for tensor in tensors} == {408_512 * 4}
+
 
 
 def test_dsv4_max_concurrency_uses_uniform_group_pool_math():
