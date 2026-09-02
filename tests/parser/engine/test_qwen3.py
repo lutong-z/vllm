@@ -44,6 +44,45 @@ def parser(mock_tokenizer):
     )
 
 
+
+class TestUnclosedParameterFlush:
+    def test_unclosed_parameter_still_streams_valid_json(self, parser, mock_request):
+        """A tool call cut off mid-parameter must not stream unparsable JSON."""
+        raw = (
+            "<tool_call>\n<function=write_file>\n"
+            "<parameter=path>\nREADME.md\n</parameter>\n"
+            "<parameter=content>\n# Title\n\n"
+            "body text that continues for a while\n\n"
+            "<tool_call>\n<function=write_file>"
+        )
+        results = simulate_tool_streaming(parser, mock_request, list(raw))
+        finish = parser.finish_streaming()
+        if finish is not None:
+            results.append((finish, ""))
+
+        args = collect_tool_arguments(results)
+        assert args, "no arguments were streamed"
+        assert args.startswith('{"path": "README.md"'), args[:60]
+        json.loads(args)
+
+    def test_truncated_parameter_still_streams_valid_json(self, parser, mock_request):
+        """A truncated tool parameter must still produce valid JSON."""
+        raw = (
+            "<tool_call>\n<function=write_file>\n"
+            "<parameter=path>\nREADME.md\n</parameter>\n"
+            "<parameter=content>\n# Title\n\n"
+            "body text that stops mid-sen"
+        )
+        results = simulate_tool_streaming(parser, mock_request, list(raw))
+        finish = parser.finish_streaming()
+        if finish is not None:
+            results.append((finish, ""))
+
+        args = collect_tool_arguments(results)
+        assert args, "no arguments were streamed"
+        assert args.startswith('{"path": "README.md"'), args[:60]
+        json.loads(args)
+
 class TestNonStreaming:
     def test_no_tool_calls(self, parser, mock_request):
         result = parser.extract_tool_calls(
