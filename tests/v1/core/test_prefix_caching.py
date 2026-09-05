@@ -2292,6 +2292,40 @@ def test_maybe_evict_cached_block():
     assert pool.cached_block_hash_to_block._cache == {}
 
 
+def test_prefix_cache_idle_timeout_only_expires_free_blocks(monkeypatch):
+    now_ns = [10_000_000_000]
+    monkeypatch.setattr(
+        "vllm.v1.core.block_pool.time.monotonic_ns",
+        lambda: now_ns[0],
+    )
+    pool = BlockPool(
+        num_gpu_blocks=2,
+        enable_caching=True,
+        hash_block_size=16,
+        prefix_cache_idle_timeout_seconds=5,
+    )
+    block = pool.get_new_blocks(1)[0]
+    block_hash = make_block_hash_with_group_id(BlockHash(b"ttl"), 0)
+    block.set_block_hash(block_hash)
+    pool.cached_block_hash_to_block.insert(block_hash, block)
+    pool.free_blocks([block])
+
+    now_ns[0] += 4_999_999_999
+    assert pool.expire_cached_blocks() == 0
+    assert pool.cached_block_hash_to_block.get_one_block(block_hash) is block
+
+    pool.touch([block])
+    now_ns[0] += 2
+    assert pool.expire_cached_blocks() == 0
+    assert pool.cached_block_hash_to_block.get_one_block(block_hash) is block
+
+    pool.free_blocks([block])
+    now_ns[0] += 5_000_000_000
+    assert pool.expire_cached_blocks() == 1
+    assert pool.cached_block_hash_to_block.get_one_block(block_hash) is None
+    assert pool.get_new_blocks(1)[0] is block
+
+
 @pytest.mark.parametrize("blocks_to_cache", [2, 3, 10])
 def test_kv_cache_events(blocks_to_cache: int):
     block_size = 16

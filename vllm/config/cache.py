@@ -96,6 +96,12 @@ class CacheConfig:
     `ModelConfig` and that value should be manually duplicated here."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
+    prefix_cache_idle_timeout_seconds: float | None = Field(default=None, gt=0)
+    """Expire cached GPU blocks after this many idle seconds.
+
+    Expiration applies only after a block becomes unreferenced. Active and
+    shared blocks are never expired. ``None`` preserves capacity-driven LRU.
+    """
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:
 
@@ -218,6 +224,7 @@ class CacheConfig:
             "num_gpu_blocks_override",
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
+            "prefix_cache_idle_timeout_seconds",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
             "mamba_page_size_padded",
@@ -253,6 +260,17 @@ class CacheConfig:
         if value is None:
             return value
         return handler(value)
+
+    @model_validator(mode="after")
+    def _validate_prefix_cache_idle_timeout(self) -> "CacheConfig":
+        if (
+            self.prefix_cache_idle_timeout_seconds is not None
+            and not self.enable_prefix_caching
+        ):
+            raise ValueError(
+                "prefix_cache_idle_timeout_seconds requires prefix caching"
+            )
+        return self
 
     @model_validator(mode="after")
     def _apply_block_size_default(self) -> "CacheConfig":

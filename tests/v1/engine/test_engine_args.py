@@ -48,6 +48,23 @@ def test_prefix_caching_from_cli():
     with pytest.raises(ArgumentError):
         args = parser.parse_args(["--prefix-caching-hash-algo", "invalid"])
 
+    args = parser.parse_args(["--prefix-cache-idle-timeout-seconds", "300"])
+    vllm_config = EngineArgs.from_cli_args(args=args).create_engine_config()
+    assert vllm_config.cache_config.prefix_cache_idle_timeout_seconds == 300
+
+    args = parser.parse_args(
+        [
+            "--no-enable-prefix-caching",
+            "--prefix-cache-idle-timeout-seconds",
+            "300",
+        ]
+    )
+    with pytest.raises(
+        ValueError,
+        match="prefix_cache_idle_timeout_seconds requires prefix caching",
+    ):
+        EngineArgs.from_cli_args(args=args).create_engine_config()
+
 
 @pytest.mark.skipif(_xxhash is None, reason="xxhash not installed")
 def test_prefix_caching_xxhash_from_cli():

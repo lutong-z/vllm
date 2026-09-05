@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -156,7 +157,10 @@ class BlockPool:
             where different KV cache groups have different block sizes, the
             actual block size can be a multiple of hash_block_size.
         enable_kv_cache_events: Whether to enable kv cache events.
-        metrics_collector: Optional metrics collector for tracking block residency.
+        metrics_collector: Optional metrics collector for tracking block
+            residency.
+        prefix_cache_idle_timeout_seconds: Expire unreferenced cached blocks
+            after this many idle seconds. ``None`` disables expiration.
     """
 
     def __init__(
@@ -166,11 +170,25 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        prefix_cache_idle_timeout_seconds: float | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+        if prefix_cache_idle_timeout_seconds is not None:
+            if not enable_caching:
+                raise ValueError("prefix cache idle expiration requires prefix caching")
+            if prefix_cache_idle_timeout_seconds <= 0:
+                raise ValueError(
+                    "prefix_cache_idle_timeout_seconds must be greater than 0"
+                )
+            self.prefix_cache_idle_timeout_ns: int | None = max(
+                1, round(prefix_cache_idle_timeout_seconds * 1e9)
+            )
+        else:
+            self.prefix_cache_idle_timeout_ns = None
+        self._next_prefix_cache_expiry_ns: int | None = None
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -701,6 +719,41 @@ class BlockPool:
         self._emit_block_removed_events(evicted_hashes)
         return True
 
+    def expire_cached_blocks(self) -> int:
+        """Expire free cached blocks whose idle timeout has elapsed."""
+        timeout_ns = self.prefix_cache_idle_timeout_ns
+        next_expiry_ns = self._next_prefix_cache_expiry_ns
+        if timeout_ns is None or next_expiry_ns is None:
+            return 0
+
+        now_ns = time.monotonic_ns()
+        if now_ns < next_expiry_ns:
+            return 0
+
+        expired_blocks: list[KVCacheBlock] = []
+        next_expiry_ns = None
+        for block in self.free_block_queue.iter_blocks_after(None):
+            if block.block_hash is None:
+                continue
+            idle_since_ns = block.cache_idle_since_ns
+            assert idle_since_ns is not None
+            block_expiry_ns = idle_since_ns + timeout_ns
+            if block_expiry_ns <= now_ns:
+                expired_blocks.append(block)
+            elif next_expiry_ns is None or block_expiry_ns < next_expiry_ns:
+                next_expiry_ns = block_expiry_ns
+
+        removed_hashes: list[BlockHashWithGroupId] = []
+        for block in expired_blocks:
+            self.free_block_queue.remove(block)
+            if self.metrics_collector:
+                self.metrics_collector.on_block_evicted(block)
+            removed_hashes.extend(self._remove_cached_block_hashes(block))
+        self.free_block_queue.prepend_n(expired_blocks)
+        self._emit_block_removed_events(removed_hashes)
+        self._next_prefix_cache_expiry_ns = next_expiry_ns
+        return len(expired_blocks)
+
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
         """Touch a block increases its reference count by 1, and may remove
         the block from the free queue. This is used when a block is hit by
@@ -714,6 +767,7 @@ class BlockPool:
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
+                block.cache_idle_since_ns = None
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -738,6 +792,16 @@ class BlockPool:
                     blocks_without_hash.append(block)
                 else:
                     blocks_with_hash.append(block)
+        if blocks_with_hash and self.prefix_cache_idle_timeout_ns is not None:
+            idle_since_ns = time.monotonic_ns()
+            for block in blocks_with_hash:
+                block.cache_idle_since_ns = idle_since_ns
+            expiry_ns = idle_since_ns + self.prefix_cache_idle_timeout_ns
+            if (
+                self._next_prefix_cache_expiry_ns is None
+                or expiry_ns < self._next_prefix_cache_expiry_ns
+            ):
+                self._next_prefix_cache_expiry_ns = expiry_ns
 
         # Blocks without hash get evicted first - prepend them last to the tail
         self.free_block_queue.prepend_n(blocks_without_hash)
@@ -787,6 +851,7 @@ class BlockPool:
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
+        self._next_prefix_cache_expiry_ns = None
 
         if self.metrics_collector:
             self.metrics_collector.reset()
