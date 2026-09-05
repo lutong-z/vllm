@@ -582,6 +582,23 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def reset_load_state(self, request: "Request") -> bool:
+        """Reset connector-side state so a failed async KV load can be
+        retried with a fresh lookup/retrieve cycle.
+
+        Called by the scheduler when a request's external KV load failed and
+        the request's blocks are about to be freed. The request will then
+        re-enter admission, re-running get_num_new_matched_tokens().
+
+        Returns:
+            True if the connector cleaned up all per-request lookup/retrieve
+            state (locks, futures, trackers) and a retry is safe. Connectors
+            that cannot guarantee a clean retry must return False, and the
+            scheduler applies the configured load-failure policy instead.
+        """
+        return False
+
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
         Update KVConnector state from worker-side connectors output.

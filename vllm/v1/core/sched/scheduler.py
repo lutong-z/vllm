@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -54,7 +55,13 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    CrossAttentionSpec,
+    EncoderOnlyAttentionSpec,
+    KVCacheConfig,
+    MambaSpec,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -137,6 +144,14 @@ class Scheduler(SchedulerInterface):
         # Whether a preempted request's in-flight output must be dropped; see
         # KVConnectorBase_V1.requires_kv_delivery.
         self.requires_kv_delivery = False
+        # External KV load retry knobs: a failed async load is retried with a
+        # fresh lookup/retrieve cycle instead of recomputing, while the
+        # connector supports a clean state reset and retries remain.
+        self.max_kv_load_retries = envs.VLLM_KV_LOAD_MAX_RETRIES
+        self.kv_load_retry_backoff_seconds = envs.VLLM_KV_LOAD_RETRY_BACKOFF_SECONDS
+        # Session-aware eviction: blocks freed by session-tagged requests stay
+        # protected from eviction for this many seconds.
+        self.session_block_protect_seconds = envs.VLLM_SESSION_BLOCK_PROTECT_SECONDS
         kv_transfer_config = self.vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             assert not self.is_encoder_decoder, (
@@ -2464,10 +2479,26 @@ class Scheduler(SchedulerInterface):
     def set_pause_state(self, pause_state: PauseState) -> None:
         self._pause_state = pause_state
 
+    def _stamp_session_block_protection(self, request: Request) -> None:
+        """Extend eviction protection for blocks owned by a session-tagged
+        request, so a concurrent cold prefill cannot evict an active
+        session's cached prefix. Protection is a victim-ordering hint only:
+        allocation falls back to protected blocks when nothing else is free.
+        """
+        if request.session_id is None or self.session_block_protect_seconds <= 0:
+            return
+        until_ns = time.monotonic_ns() + int(self.session_block_protect_seconds * 1e9)
+        for group_blocks in self.kv_cache_manager.coordinator.get_blocks(
+            request.request_id
+        ):
+            for block in group_blocks:
+                block.protected_until_ns = max(block.protected_until_ns, until_ns)
+
     def _free_request_blocks(self, request: Request):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        self._stamp_session_block_protection(request)
         if not self.defer_block_free or (
             # Last scheduled step already processed: no in-flight write remains
             # (always the case for a normal finish), so free now.
@@ -2760,19 +2791,67 @@ class Scheduler(SchedulerInterface):
             self._request_remaining_blocks(req) for req in self._inflight_prefills
         )
 
-    def _update_waiting_for_remote_kv(self, request: Request) -> None:
+    def _maybe_retry_kv_load(self, request: Request) -> bool:
+        """Try to schedule a fresh external lookup/retrieve cycle for a
+        request whose async KV load failed, instead of recomputing.
+
+        The retry is only attempted when the failure policy is "recompute",
+        retries remain, and the connector accepts a clean state reset. On
+        success the request's blocks and computed-token state are dropped so
+        the next admission re-runs the external lookup from scratch.
+        """
+        if not self.recompute_kv_load_failures:
+            return False
+        if request.kv_load_retry_count >= self.max_kv_load_retries:
+            return False
+        if self.connector is None:
+            return False
+        reset_load_state = getattr(self.connector, "reset_load_state", None)
+        if not callable(reset_load_state) or reset_load_state(request) is not True:
+            return False
+
+        request.kv_load_retry_count += 1
+        request.kv_load_retry_pending = True
+        request.kv_load_retry_not_before = (
+            time.monotonic() + self.kv_load_retry_backoff_seconds
+        )
+        # Drop the failed load's blocks and computed state. Freed blocks are
+        # re-recorded for zeroing when reallocated, and a successful retry
+        # overwrites them, so the failed load's unwritten/skipped-zeroing
+        # state needs no further handling.
+        self._stamp_session_block_protection(request)
+        self.kv_cache_manager.free(request)
+        request.num_computed_tokens = 0
+        self._inflight_prefills.discard(request)
+        logger.info(
+            "Retrying external KV load for %s (attempt %d/%d)",
+            request.request_id,
+            request.kv_load_retry_count,
+            self.max_kv_load_retries,
+        )
+        return True
+
+    def _update_waiting_for_remote_kv(self, request: Request) -> bool:
         """
         KV Connector: update request state after async recv is finished.
 
         When the kv transfer is ready, we cache the blocks
         and the request state will be moved back to WAITING from
         WAITING_FOR_REMOTE_KV.
+
+        Returns:
+            True if the request can be promoted to a schedulable state;
+            False if it must stay blocked (a load retry is pending).
         """
         assert self.connector is not None
 
         if request.request_id in self.failed_recving_kv_req_ids:
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
+            self.failed_recving_kv_req_ids.remove(request.request_id)
+            if self._maybe_retry_kv_load(request):
+                self.finished_recving_kv_req_ids.remove(request.request_id)
+                return False
             if request.num_computed_tokens:
                 # Cache any valid computed tokens.
                 self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
@@ -2788,9 +2867,8 @@ class Scheduler(SchedulerInterface):
                 # There may be a local cache hit on retry.
                 # (Freed blocks are re-recorded for zeroing when
                 # reallocated, so the skipped blocks need no handling.)
+                self._stamp_session_block_protection(request)
                 self.kv_cache_manager.free(request)
-
-            self.failed_recving_kv_req_ids.remove(request.request_id)
         else:
             # Now that the blocks are ready, actually cache them.
             # This will cache the blocks iff caching is enabled.
@@ -2802,18 +2880,29 @@ class Scheduler(SchedulerInterface):
                 request.num_computed_tokens = request.num_tokens - 1
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
+        return True
 
     def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
         """
         Try to promote a blocked waiting request back to schedulable states.
         """
         if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            if request.kv_load_retry_pending:
+                # A failed load is being retried; hold the request until the
+                # backoff elapses, then re-enter admission for a fresh
+                # external lookup.
+                if time.monotonic() < request.kv_load_retry_not_before:
+                    return False
+                request.kv_load_retry_pending = False
+                request.status = RequestStatus.WAITING
+                return True
             # finished_recving_kv_req_ids is populated during
             # update_from_output(), based on worker-side connector signals
             # in KVConnectorOutput.finished_recving
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
-            self._update_waiting_for_remote_kv(request)
+            if not self._update_waiting_for_remote_kv(request):
+                return False
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:
@@ -2945,57 +3034,74 @@ class Scheduler(SchedulerInterface):
         # these requests must be rescheduled, but only the first will recompute
         # it. This set tracks blocks already marked for recomputation.
         marked_invalid_block_ids: set[int] = set()
+        kv_cache_groups = self.kv_cache_config.kv_cache_groups
+        null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
         for request in requests:
             is_affected = False
-            marked_invalid_block = False
+            marked_own_invalid = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            all_group_block_ids = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
 
-            req_num_computed_blocks = (
-                req_num_computed_tokens + self.block_size - 1
-            ) // self.block_size
-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
-                if block_id not in invalid_block_ids:
-                    continue
-
-                is_affected = True
-
-                if block_id in marked_invalid_block_ids:
-                    # This invalid block is shared with a previous request
-                    # and was already marked for recomputation.
-                    # This means this request can still consider this block
-                    # as computed when rescheduled.
-                    # Currently this only applies to sync loading; Async
-                    # loading does not yet support block sharing
-                    continue
-
-                marked_invalid_block_ids.add(block_id)
-
-                if marked_invalid_block:
-                    # This request has already marked an invalid block for
-                    # recomputation and updated its num_computed_tokens.
-                    continue
-
-                marked_invalid_block = True
-                # Truncate the computed tokens at the first failed block
-                request.num_computed_tokens = idx * self.block_size
-                num_affected_tokens = (
-                    req_num_computed_tokens - request.num_computed_tokens
+            # Hybrid KV cache: truncate the computed prefix at the earliest
+            # invalid position across all groups. Attention groups map a
+            # block index to a token position via the group's block size
+            # (same convention as get_block_ids_for_computed_tokens);
+            # non-attention state groups cannot be mapped, so an invalid
+            # block there invalidates the whole transfer for this request.
+            min_valid_tokens = req_num_computed_tokens
+            for kv_cache_group, group_block_ids in zip(
+                kv_cache_groups, all_group_block_ids
+            ):
+                spec = kv_cache_group.kv_cache_spec
+                prefix_indexed = isinstance(spec, AttentionSpec) and not isinstance(
+                    spec, (CrossAttentionSpec, EncoderOnlyAttentionSpec)
                 )
-                total_affected_tokens += num_affected_tokens
+                tokens_per_block = spec.block_size
+                req_num_computed_blocks = (
+                    req_num_computed_tokens + tokens_per_block - 1
+                ) // tokens_per_block
+                for idx, block_id in zip(
+                    range(req_num_computed_blocks), group_block_ids
+                ):
+                    if block_id not in invalid_block_ids:
+                        continue
+                    if block_id == null_block_id:
+                        # The null block is a placeholder without data; a
+                        # resume from the truncated prefix recomputes the
+                        # groups it stands in for anyway.
+                        continue
 
-                # collect invalid block and all downstream dependent blocks
-                if evict_blocks:
-                    blocks_to_evict.update(req_block_ids[idx:])
+                    is_affected = True
+
+                    if block_id in marked_invalid_block_ids:
+                        # This invalid block is shared with a previous request
+                        # and was already marked for recomputation.
+                        # This means this request can still consider this block
+                        # as computed when rescheduled.
+                        # Currently this only applies to sync loading; Async
+                        # loading does not yet support block sharing
+                        continue
+
+                    marked_invalid_block_ids.add(block_id)
+                    marked_own_invalid = True
+                    # Truncate the computed tokens at the earliest failed
+                    # position across groups.
+                    min_valid_tokens = min(
+                        min_valid_tokens,
+                        idx * tokens_per_block if prefix_indexed else 0,
+                    )
+
+                    # collect invalid block and all downstream dependent blocks
+                    if evict_blocks:
+                        blocks_to_evict.update(group_block_ids[idx:])
 
             if is_affected:
-                if not marked_invalid_block:
+                if not marked_own_invalid:
                     # All invalid blocks of this request are shared with
                     # previous requests and will be recomputed by them.
                     # Revert to considering only cached tokens as computed.
@@ -3005,6 +3111,11 @@ class Scheduler(SchedulerInterface):
                         request.num_computed_tokens - req_num_computed_tokens
                     )
                     request.num_computed_tokens = req_num_computed_tokens
+                else:
+                    total_affected_tokens += (
+                        req_num_computed_tokens - min_valid_tokens
+                    )
+                    request.num_computed_tokens = min_valid_tokens
 
                 affected_req_ids.add(request.request_id)
 

@@ -14,6 +14,7 @@ from .utils import (
     create_request,
     create_scheduler,
     create_vllm_config,
+    make_kv_cache_config,
 )
 
 
@@ -337,3 +338,259 @@ def test_async_progressive_load_failure(
         assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
         assert scheduler.failed_recving_kv_req_ids == {request.request_id}
         assert scheduler.connector.get_num_new_matched_tokens.call_count == 1
+
+
+def test_async_load_failure_retries_before_recompute(scheduler: Scheduler):
+    """A transient async-load failure retries the external lookup instead of
+    recomputing, when the connector accepts a load-state reset."""
+    num_prompt_blocks, num_external_computed_blocks = 100, 99
+    num_prompt_tokens = num_prompt_blocks * scheduler.block_size
+    num_external_computed_tokens = num_external_computed_blocks * scheduler.block_size
+
+    request = create_request(num_tokens=num_prompt_tokens)
+    scheduler.add_request(request=request)
+
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        _make_get_num_new_matched_tokens(
+            {request.request_id: num_external_computed_tokens}, async_load=True
+        )
+    )
+    scheduler.connector.reset_load_state.return_value = True
+    scheduler.connector.take_events.return_value = ()
+    scheduler.kv_load_retry_backoff_seconds = 0
+
+    scheduler_output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler.connector.get_num_new_matched_tokens.call_count == 1
+
+    # First load fails at block 50; the worker then reports the transfer done.
+    (req_block_ids,) = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            reqs=[],
+            finished_recving=set(),
+            invalid_block_ids={req_block_ids[50]},
+            use_eos=True,
+        ),
+    )
+    scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            reqs=[],
+            finished_recving={request.request_id},
+            invalid_block_ids=None,
+            use_eos=True,
+        ),
+    )
+
+    # Promotion schedules a retry instead of truncating + recomputing. The
+    # request moves to the skipped queue and is re-examined next step.
+    scheduler.schedule()
+    scheduler.connector.reset_load_state.assert_called_once_with(request)
+    assert request.kv_load_retry_count == 1
+    assert request.request_id not in scheduler.failed_recving_kv_req_ids
+    assert request.request_id not in scheduler.finished_recving_kv_req_ids
+
+    # backoff=0: the next step promotes the request and re-runs the external
+    # lookup, starting a fresh async load with new blocks.
+    scheduler.schedule()
+    assert scheduler.connector.get_num_new_matched_tokens.call_count == 2
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert request.num_computed_tokens == num_external_computed_tokens
+
+    # The retried load succeeds; the request resumes without any recompute.
+    scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            reqs=[],
+            finished_recving={request.request_id},
+            invalid_block_ids=None,
+            use_eos=True,
+        ),
+    )
+    scheduler.schedule()
+    assert request.status == RequestStatus.RUNNING
+    # The resumed request locally computes the remaining tail; no recompute of
+    # the externally loaded prefix occurred.
+    assert request.num_computed_tokens >= num_external_computed_tokens
+    assert scheduler.connector.get_num_new_matched_tokens.call_count == 2
+
+
+def test_async_load_failure_retry_exhausted_recomputes(scheduler: Scheduler):
+    """Once the retry budget is spent, the failure falls back to the
+    configured recompute policy."""
+    scheduler.max_kv_load_retries = 1
+    num_prompt_blocks, num_external_computed_blocks = 100, 99
+    num_prompt_tokens = num_prompt_blocks * scheduler.block_size
+    num_external_computed_tokens = num_external_computed_blocks * scheduler.block_size
+
+    request = create_request(num_tokens=num_prompt_tokens)
+    scheduler.add_request(request=request)
+
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        _make_get_num_new_matched_tokens(
+            {request.request_id: num_external_computed_tokens}, async_load=True
+        )
+    )
+    scheduler.connector.reset_load_state.return_value = True
+    scheduler.connector.take_events.return_value = ()
+    scheduler.kv_load_retry_backoff_seconds = 0
+
+    scheduler_output = scheduler.schedule()
+
+    def fail_load_at(scheduler_output, block_idx: int) -> None:
+        (block_ids,) = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+        scheduler.update_from_output(
+            scheduler_output,
+            create_model_runner_output(
+                reqs=[],
+                finished_recving=set(),
+                invalid_block_ids={block_ids[block_idx]},
+                use_eos=True,
+            ),
+        )
+        scheduler.update_from_output(
+            scheduler_output,
+            create_model_runner_output(
+                reqs=[],
+                finished_recving={request.request_id},
+                invalid_block_ids=None,
+                use_eos=True,
+            ),
+        )
+
+    # First failure: retry is scheduled now; re-admission happens next step.
+    fail_load_at(scheduler_output, 50)
+    scheduler.schedule()
+    assert request.kv_load_retry_count == 1
+    scheduler_output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    # Second failure: budget spent -> truncate to the valid prefix and
+    # recompute locally, without another connector reset.
+    fail_load_at(scheduler_output, 25)
+    scheduler.schedule()
+    assert scheduler.connector.reset_load_state.call_count == 1
+    assert request.kv_load_retry_count == 1
+    # Truncated to the valid prefix; async scheduling may already count the
+    # first locally recomputed chunk on top of it.
+    assert 25 * scheduler.block_size <= request.num_computed_tokens < (
+        num_external_computed_tokens
+    )
+
+
+def test_async_load_failure_retry_backoff_gates_promotion(scheduler: Scheduler):
+    """A pending retry stays blocked until its backoff deadline passes."""
+    num_prompt_blocks, num_external_computed_blocks = 100, 99
+    num_prompt_tokens = num_prompt_blocks * scheduler.block_size
+    num_external_computed_tokens = num_external_computed_blocks * scheduler.block_size
+
+    request = create_request(num_tokens=num_prompt_tokens)
+    scheduler.add_request(request=request)
+
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        _make_get_num_new_matched_tokens(
+            {request.request_id: num_external_computed_tokens}, async_load=True
+        )
+    )
+    scheduler.connector.reset_load_state.return_value = True
+    scheduler.connector.take_events.return_value = ()
+    scheduler.kv_load_retry_backoff_seconds = 1000
+
+    scheduler_output = scheduler.schedule()
+    (req_block_ids,) = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            reqs=[],
+            finished_recving=set(),
+            invalid_block_ids={req_block_ids[50]},
+            use_eos=True,
+        ),
+    )
+    scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            reqs=[],
+            finished_recving={request.request_id},
+            invalid_block_ids=None,
+            use_eos=True,
+        ),
+    )
+
+    # Retry is scheduled, but the 1000s backoff keeps the request blocked.
+    scheduler.schedule()
+    assert request.kv_load_retry_pending
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler.connector.get_num_new_matched_tokens.call_count == 1
+
+    # Deadline reached: the gate opens and admission re-runs the lookup.
+    request.kv_load_retry_not_before = 0.0
+    scheduler.schedule()
+    assert not request.kv_load_retry_pending
+    assert scheduler.connector.get_num_new_matched_tokens.call_count == 2
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+
+def test_async_load_failure_multi_group_truncates_without_crash():
+    """Hybrid (multi-group) KV cache: invalid blocks must truncate the
+    computed prefix at the earliest invalid position across groups instead
+    of crashing on the single-group unpack."""
+    vllm_config = create_vllm_config(kv_load_failure_policy="recompute")
+    kv_cache_config = make_kv_cache_config(block_size=16, swa_enabled=True, num_blocks=1000)
+    scheduler = create_scheduler(vllm_config, kv_cache_config=kv_cache_config)
+
+    num_prompt_blocks, num_external_computed_blocks = 100, 99
+    num_prompt_tokens = num_prompt_blocks * scheduler.block_size
+    num_external_computed_tokens = num_external_computed_blocks * scheduler.block_size
+
+    request = create_request(num_tokens=num_prompt_tokens)
+    scheduler.add_request(request=request)
+
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        _make_get_num_new_matched_tokens(
+            {request.request_id: num_external_computed_tokens}, async_load=True
+        )
+    )
+    scheduler.connector.take_events.return_value = ()
+
+    scheduler_output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    # Fail block 50 of the full-attention group. The sliding-window
+    # group's entries are null-block placeholders during the async load;
+    # including one proves null blocks cannot force a full truncation.
+    group_block_ids = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    assert len(group_block_ids) == 2
+    invalid_block_ids = {group_block_ids[0][50], group_block_ids[1][10]}
+    scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            reqs=[],
+            finished_recving=set(),
+            invalid_block_ids=invalid_block_ids,
+            use_eos=True,
+        ),
+    )
+    assert request.num_computed_tokens == 50 * scheduler.block_size
+    assert scheduler.failed_recving_kv_req_ids == {request.request_id}
+
+    # The transfer then completes; the request recovers via recompute
+    # without any engine crash.
+    scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            reqs=[],
+            finished_recving={request.request_id},
+            invalid_block_ids=None,
+            use_eos=True,
+        ),
+    )
+    scheduler.schedule()
+    assert request.status == RequestStatus.RUNNING
+    assert request.num_computed_tokens >= 50 * scheduler.block_size
