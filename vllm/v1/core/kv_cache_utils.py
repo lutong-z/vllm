@@ -132,6 +132,12 @@ class KVCacheBlock:
     _block_hash_num_tokens: int | None = None
     # Monotonic timestamp set only while a cached block is unreferenced.
     cache_idle_since_ns: int | None = None
+    # Monotonic deadline before which this block is skipped during victim
+    # selection, set for blocks owned by session-tagged requests so that
+    # concurrent cold prefills cannot evict an active session's cached
+    # prefix. 0 means unprotected. A hint only: allocation falls back to
+    # protected blocks when nothing else is free.
+    protected_until_ns: int = 0
 
     # Used to construct a doubly linked list for free blocks.
     # These two attributes should only be manipulated by FreeKVCacheBlockQueue.
@@ -165,6 +171,7 @@ class KVCacheBlock:
         self._block_hash = None
         self._block_hash_num_tokens = None
         self.cache_idle_since_ns = None
+        self.protected_until_ns = 0
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
@@ -307,6 +314,41 @@ class FreeKVCacheBlockQueue:
             # the new first block.
             self.fake_free_list_head.next_free_block = curr_block
             curr_block.prev_free_block = self.fake_free_list_head
+        return ret
+
+    def popleft_n_where(
+        self, n: int, predicate: "Callable[[KVCacheBlock], bool]"
+    ) -> list[KVCacheBlock]:
+        """Pop up to n free blocks matching ``predicate``, in queue order.
+
+        Unlike popleft_n, this walks the list and unlinks matching nodes, so
+        it returns fewer than n blocks when not enough blocks match.
+
+        Args:
+            n: The maximum number of blocks to pop.
+            predicate: Condition a block must satisfy to be popped.
+
+        Returns:
+            A list of up to n free blocks.
+        """
+        if n == 0:
+            return []
+        ret: list[KVCacheBlock] = []
+        curr_block = self.fake_free_list_head.next_free_block
+        while curr_block is not self.fake_free_list_tail and len(ret) < n:
+            assert curr_block is not None
+            next_block = curr_block.next_free_block
+            if predicate(curr_block):
+                # Unlink the block from the list.
+                assert curr_block.prev_free_block is not None
+                assert next_block is not None
+                curr_block.prev_free_block.next_free_block = next_block
+                next_block.prev_free_block = curr_block.prev_free_block
+                curr_block.prev_free_block = None
+                curr_block.next_free_block = None
+                ret.append(curr_block)
+            curr_block = next_block
+        self.num_free_blocks -= len(ret)
         return ret
 
     def remove(self, block: KVCacheBlock) -> None:
