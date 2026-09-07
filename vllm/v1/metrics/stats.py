@@ -127,6 +127,8 @@ class PrefixCacheStats(BaseCacheStats):
 
     preempted_hits: int = 0
     """The `hits` number for preempted requests."""
+    expired_blocks: int = 0
+    """The number of idle GPU cache blocks expired in this update."""
 
     def record(self, num_tokens: int, num_hits: int, preempted: bool) -> None:
         """Aggregate request information into the stats."""

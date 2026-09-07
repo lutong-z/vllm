@@ -131,6 +131,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
+        prefix_cache_idle_timeout_seconds: float | None = None,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -161,6 +162,7 @@ class KVCacheManager:
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+            prefix_cache_idle_timeout_seconds=prefix_cache_idle_timeout_seconds,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -881,5 +883,8 @@ class KVCacheManager:
         return offloads
 
     def new_step_starts(self) -> None:
-        """Notify the coordinator that a new step is starting."""
+        """Advance per-step state and expire idle prefix-cache blocks."""
         self.coordinator.new_step_starts()
+        expired_blocks = self.block_pool.expire_cached_blocks()
+        if self.prefix_cache_stats is not None:
+            self.prefix_cache_stats.expired_blocks += expired_blocks
