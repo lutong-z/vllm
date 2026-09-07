@@ -174,6 +174,14 @@ class Request:
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 
+        # External KV load retry state. When an async load fails transiently,
+        # the scheduler re-runs the external lookup instead of recomputing
+        # while retries remain; `kv_load_retry_pending` keeps the request
+        # blocked until `kv_load_retry_not_before` (monotonic seconds).
+        self.kv_load_retry_count = 0
+        self.kv_load_retry_pending = False
+        self.kv_load_retry_not_before = 0.0
+
         # Multi-modal related
         self.mm_features = mm_features or []
 

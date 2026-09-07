@@ -669,6 +669,12 @@ class BlockPool:
 
         Note that we do not check block cache in this function.
 
+        Session-protected blocks (protected_until_ns in the future) are only
+        taken after every unprotected free block, so a concurrent cold
+        prefill cannot evict an active session's cached prefix while any
+        other victim remains. Protection never blocks allocation: when only
+        protected blocks are left, they are taken in normal queue order.
+
         Args:
             num_blocks: The number of blocks to allocate.
 
@@ -678,7 +684,19 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        now_ns = time.monotonic_ns()
+        ret = self.free_block_queue.popleft_n_where(
+            num_blocks, lambda b: b.protected_until_ns <= now_ns
+        )
+        if len(ret) < num_blocks:
+            # Only protected blocks remain; take them in queue order.
+            ret.extend(
+                self.free_block_queue.popleft_n_where(
+                    num_blocks - len(ret), lambda _: True
+                )
+            )
+        for block in ret:
+            block.protected_until_ns = 0
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -734,6 +752,11 @@ class BlockPool:
         next_expiry_ns = None
         for block in self.free_block_queue.iter_blocks_after(None):
             if block.block_hash is None:
+                continue
+            if block.protected_until_ns > now_ns:
+                # Session protection extends the block's effective idle life.
+                if next_expiry_ns is None or block.protected_until_ns < next_expiry_ns:
+                    next_expiry_ns = block.protected_until_ns
                 continue
             idle_since_ns = block.cache_idle_since_ns
             assert idle_since_ns is not None

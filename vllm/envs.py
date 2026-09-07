@@ -288,6 +288,9 @@ if TYPE_CHECKING:
     VLLM_MQ_MAX_CHUNK_BYTES_MB: int = 16
     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
     VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS: int = 5
+    VLLM_KV_LOAD_MAX_RETRIES: int = 2
+    VLLM_KV_LOAD_RETRY_BACKOFF_SECONDS: float = 1.0
+    VLLM_SESSION_BLOCK_PROTECT_SECONDS: float = 600.0
     VLLM_KV_CACHE_LAYOUT: Literal["NHD", "HND"] | None = None
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
@@ -2213,6 +2216,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # raw bytes. Defaults to True for backward compatibility.
     "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": lambda: bool(
         int(os.getenv("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES", "1"))
+    ),
+    # Maximum number of times a request retries an external KV load that
+    # failed with invalid blocks before the configured load-failure policy
+    # applies. Only effective with the "recompute" policy and a connector
+    # whose reset_load_state() accepts the retry.
+    "VLLM_KV_LOAD_MAX_RETRIES": lambda: int(
+        os.getenv("VLLM_KV_LOAD_MAX_RETRIES", "2")
+    ),
+    # Backoff in seconds before a failed external KV load is retried, giving
+    # the remote cache time to release contended staging capacity.
+    "VLLM_KV_LOAD_RETRY_BACKOFF_SECONDS": lambda: float(
+        os.getenv("VLLM_KV_LOAD_RETRY_BACKOFF_SECONDS", "1")
+    ),
+    # How long blocks freed by a session-tagged request stay protected from
+    # prefix-cache eviction. While protected, a concurrent cold prefill
+    # cannot take them as eviction victims unless no other free block
+    # remains. 0 disables session-aware eviction protection.
+    "VLLM_SESSION_BLOCK_PROTECT_SECONDS": lambda: float(
+        os.getenv("VLLM_SESSION_BLOCK_PROTECT_SECONDS", "600")
     ),
     # Name of the shared memory buffer used for object storage.
     # Only effective when mm_config.mm_processor_cache_type == "shm".
