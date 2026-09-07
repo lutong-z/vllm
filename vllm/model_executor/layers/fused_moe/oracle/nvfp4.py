@@ -35,6 +35,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
+from vllm.utils.flashinfer import has_flashinfer_b12x_moe_activation
 
 logger = init_logger(__name__)
 
@@ -215,6 +216,14 @@ def select_nvfp4_moe_backend(
         NvFp4MoeBackend.EMULATION,
         NvFp4MoeBackend.HUMMING,
     }
+
+    # B12x applies the clamp only for SwiGLU-OAI and only when the installed
+    # FlashInfer wrapper exposes the corresponding activation parameters.
+    if (
+        config.activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        and has_flashinfer_b12x_moe_activation()
+    ):
+        NVFP4_BACKENDS_WITH_CLAMP.add(NvFp4MoeBackend.FLASHINFER_B12X)
 
     def _backend_supports_clamp(backend: NvFp4MoeBackend) -> bool:
         if backend in NVFP4_BACKENDS_WITH_CLAMP:
