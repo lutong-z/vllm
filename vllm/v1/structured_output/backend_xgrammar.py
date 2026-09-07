@@ -156,12 +156,11 @@ class XgrammarGrammar(StructuredOutputGrammar):
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         """Accepts a list of tokens and advances the FSM.
 
-        Returns True if all grammar-constrained tokens were accepted.
-        Tokens after termination are ignored. Returns False if the FSM
-        failed to advance.
+        Returns True if the FSM was advanced successfully.
+        Returns False if the FSM failed to advance.
         """
         if self._is_terminated:
-            return True
+            return False
         for token in tokens:
             if not self.matcher.accept_token(token):
                 logger.error(
@@ -172,9 +171,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
                 )
                 return False
             self.num_processed_tokens += 1
-            self._is_terminated = self.matcher.is_terminated()
-            if self._is_terminated:
-                break
+        self._is_terminated = self.matcher.is_terminated()
         return True
 
     def validate_tokens(self, tokens: list[int]) -> list[int]:
@@ -183,15 +180,10 @@ class XgrammarGrammar(StructuredOutputGrammar):
 
         Returns the prefix list of tokens that are accepted by the FSM.
         """
-        if self._is_terminated:
-            return []
-
         accepted_tokens = []
         for token in tokens:
             if self.matcher.accept_token(token):
                 accepted_tokens.append(token)
-                if self.matcher.is_terminated():
-                    break
             else:
                 break
         if len(accepted_tokens) > 0:
@@ -211,9 +203,8 @@ class XgrammarGrammar(StructuredOutputGrammar):
         return self._is_terminated
 
     def reset(self):
-        self.matcher.reset()
         self.num_processed_tokens = 0
-        self._is_terminated = False
+        self.matcher.reset()
 
 
 # cf https://github.com/mlc-ai/xgrammar/blob/a32ac892676d2eedc0327416105b9b06edfb94b2/cpp/json_schema_converter.cc
