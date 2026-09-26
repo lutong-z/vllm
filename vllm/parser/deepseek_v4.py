@@ -52,15 +52,27 @@ DSML_FOREIGN_TOOL_START = f"<{_DSML}function_calls>"
 DSML_FOREIGN_TOOL_END = f"</{_DSML}function_calls>"
 
 _ESCAPED_DSML = re.escape(_DSML)
-_PARAM_RE = re.compile(
-    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
-    rf"(.*?)</{_ESCAPED_DSML}parameter>",
-    re.DOTALL,
-)
-_PARTIAL_PARAM_RE = re.compile(
-    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
-    rf"(.*)$",
-    re.DOTALL,
+_DSML_PARAM_START = f"<{_DSML}parameter"
+
+
+def _param_patterns(
+    param_start: str, param_close: str
+) -> tuple[re.Pattern, re.Pattern]:
+    """Complete and trailing-partial parameter regexes for one DSML dialect.
+
+    The ``string`` attribute is optional: the model sometimes omits it, and
+    dropping such a parameter hands the client a tool call with no arguments.
+    """
+    start, close = re.escape(param_start), re.escape(param_close)
+    head = rf'{start}\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
+    return (
+        re.compile(rf"{head}(.*?)(?:{close}|(?={start}\s+name=))", re.DOTALL),
+        re.compile(rf"{head}(.*)$", re.DOTALL),
+    )
+
+
+_PARAM_RE, _PARTIAL_PARAM_RE = _param_patterns(
+    _DSML_PARAM_START, DSML_PARAM_CLOSE
 )
 
 
